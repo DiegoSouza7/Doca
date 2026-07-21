@@ -1,0 +1,127 @@
+# Exemplo doca — API Node + MySQL + Redis + RabbitMQ
+#
+# Cenário de projeto com banco, cache e fila. Copie para a raiz como "doca.yml",
+# ajuste name/imagem/portas e remova os serviços que não usar.
+#
+# Precisa de um .env na raiz com, no mínimo:
+#   NODE_ENV=development
+#   DB_PASSWORD=senha-do-banco
+#   DB_NAME=nome-do-banco
+# (use os nomes que o seu framework espera; ajuste as referências abaixo.)
+#
+# Depois: cd projeto && doca
+
+name: minha-api
+
+services:
+  app:
+    image: docker.io/library/node:24
+    hostname: minha-api
+
+    userns_mode: ${DOCA_USERNS}
+    working_dir: /workspace
+
+    cpus: 2
+    mem_limit: 8g
+
+    env_file: [".env"]
+    ports: ["3333:3333"]
+
+    command: sleep infinity
+
+    environment:
+      TZ: America/Sao_Paulo
+
+      COREPACK_DEFAULT_TO_LATEST: "0"
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+      PATH: /home/node/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+      DOCA_INSIDE: minha-api
+
+      # Cada serviço é alcançado pelo NOME, na porta INTERNA. Isto sobrescreve
+      # o localhost que costuma estar no .env. Use os nomes de variável que o
+      # seu framework lê.
+      DB_HOST: mysql
+      DB_PORT: "3306"
+
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+
+      # A URL da fila também aponta para o nome do serviço.
+      AMQP_URL: amqp://guest:guest@rabbitmq:5672
+
+      npm_config_store_dir: /home/node/.pnpm-store
+      PNPM_HOME: /home/node/.pnpm
+      XDG_CACHE_HOME: /home/node/.cache
+      XDG_DATA_HOME: /home/node/.local/share
+      npm_config_cache: /home/node/.npm
+      YARN_CACHE_FOLDER: /home/node/.yarn
+
+    volumes:
+      - ${DOCA_HOST_PATH}:/workspace
+      - home:/home/node
+
+    # Espera os três ficarem saudáveis antes de te dar o shell.
+    depends_on:
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  mysql:
+    image: docker.io/library/mysql:8
+    environment:
+      TZ: America/Sao_Paulo
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+    ports: ["3306:3306"] # opcional: só para abrir no seu editor de SQL
+    volumes:
+      - db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: docker.io/library/redis:7
+    ports: ["6379:6379"] # opcional
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  rabbitmq:
+    image: docker.io/library/rabbitmq:3-management
+    # Precisa do mesmo userns do app. Sob Podman rootless, sem isto o RabbitMQ
+    # cria o .erlang.cookie como um usuário e tenta lê-lo como outro, e não
+    # sobe (EACCES). Ao contrário do MySQL e do Redis, ele não ajusta a
+    # permissão sozinho. No Docker rootful, ${DOCA_USERNS} vira "host" e isto
+    # não faz diferença.
+    userns_mode: ${DOCA_USERNS}
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    # 5672 é a fila; 15672 é o painel web. Publique o painel se quiser abri-lo
+    # no navegador.
+    ports: ["15672:15672"]
+    volumes:
+      - rabbit:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+volumes:
+  home:
+  db:
+  redis:
+  rabbit:

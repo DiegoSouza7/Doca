@@ -1,0 +1,91 @@
+# Exemplo doca — API Node + MySQL
+#
+# Copie para a raiz do projeto como "doca.yml" e ajuste name/imagem/portas.
+#
+# Precisa de um .env na raiz com, no mínimo:
+#   NODE_ENV=development
+#   DB_PASSWORD=senha-do-banco
+#   DB_NAME=nome-do-banco
+# (use os nomes que o seu framework espera; ajuste as referências abaixo.)
+#
+# Depois: cd projeto && doca
+
+name: minha-api
+
+services:
+  app:
+    image: docker.io/library/node:24
+    hostname: minha-api
+
+    userns_mode: ${DOCA_USERNS}
+    working_dir: /workspace
+
+    cpus: 2
+    mem_limit: 8g
+
+    env_file: [".env"]
+    ports: ["3333:3333"]
+
+    command: sleep infinity
+
+    environment:
+      TZ: America/Sao_Paulo
+
+      COREPACK_DEFAULT_TO_LATEST: "0"
+      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+
+      PATH: /home/node/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+      DOCA_INSIDE: minha-api
+
+      # O .env costuma apontar o banco para localhost (porque funciona no PC).
+      # Aqui dentro, localhost seria o próprio container — então mandamos para o
+      # nome do serviço "mysql". environment vence env_file.
+      # Use os nomes de variável que o seu framework lê.
+      DB_HOST: mysql
+      DB_PORT: "3306"
+
+      npm_config_store_dir: /home/node/.pnpm-store
+      PNPM_HOME: /home/node/.pnpm
+      XDG_CACHE_HOME: /home/node/.cache
+      XDG_DATA_HOME: /home/node/.local/share
+      npm_config_cache: /home/node/.npm
+      YARN_CACHE_FOLDER: /home/node/.yarn
+
+    volumes:
+      - ${DOCA_HOST_PATH}:/workspace
+      - home:/home/node
+
+    # O doca espera o healthcheck do banco passar antes de te dar o shell.
+    depends_on:
+      mysql:
+        condition: service_healthy
+
+  mysql:
+    image: docker.io/library/mysql:8
+
+    # Sem env_file aqui: se o .env definir um usuário chamado "root", a imagem
+    # recusa subir (root é reservado). Passamos só o necessário, interpolado
+    # do .env.
+    environment:
+      TZ: America/Sao_Paulo
+      MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
+      MYSQL_DATABASE: ${DB_NAME}
+
+    # Publique a porta se quiser abrir o banco no seu editor de SQL (Beekeeper,
+    # DBeaver...). Para a app falar com o banco isto NÃO é necessário — ela usa
+    # a rede interna. Escolha uma porta livre no host.
+    ports: ["3306:3306"]
+
+    volumes:
+      - db:/var/lib/mysql
+
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  home:
+  db:

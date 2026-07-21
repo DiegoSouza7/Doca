@@ -1,0 +1,575 @@
+#!/bin/sh
+# doca — ambiente de desenvolvimento em container.
+#
+# Um comando e você está dentro do projeto, de qualquer terminal (bash, Cursor,
+# VSCode flatpak). Projeto = qualquer pasta com um doca.yml.
+#
+# Divisão: o doca cuida do que depende da máquina (sandbox, engine, caminhos,
+# ciclo de vida). Imagem, versões, recursos e serviços são do doca.yml.
+#
+# Instalação: ./doca install     Remoção: doca uninstall
+
+set -eu
+
+DOCA_VERSION="1.0.0"
+DOCA_FILE="doca.yml"
+DOCA_BIN_DIR="$HOME/.local/bin"
+
+# O uninstall remove exatamente o que está entre estas marcas.
+DOCA_MARK_START="# >>> doca >>>"
+DOCA_MARK_END="# <<< doca <<<"
+
+# ---------------------------------------------------------------------------
+# Saída
+# ---------------------------------------------------------------------------
+
+doca_die() {
+	printf '\033[31m✖ %s\033[0m\n' "$*" >&2
+	exit 1
+}
+
+doca_info() {
+	printf '\033[36m▸\033[0m %s\n' "$*"
+}
+
+doca_ok() {
+	printf '\033[32m✔\033[0m %s\n' "$*"
+}
+
+# ---------------------------------------------------------------------------
+# 1. Guard de sandbox
+#
+# O único lugar do sistema que sabe o que é flatpak: reexecuta no host e sai.
+# Todo o resto do script ignora que flatpak existe.
+# ---------------------------------------------------------------------------
+
+doca_respawn_on_host() {
+	[ -f /.flatpak-info ] || return 0
+	[ -z "${DOCA_ON_HOST:-}" ] || return 0
+
+	exec flatpak-spawn --host \
+		--directory="$PWD" \
+		--env=DOCA_ON_HOST=1 \
+		"$DOCA_SELF" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# 2. Achar o projeto
+#
+# Sobe até encontrar um doca.yml, igual o git procurando o .git. É o que faz
+# "cd api && doca" cair no container certo sem você dizer qual.
+# ---------------------------------------------------------------------------
+
+doca_find_root() {
+	_dir=$PWD
+	while [ "$_dir" != "/" ]; do
+		if [ -f "$_dir/$DOCA_FILE" ]; then
+			printf '%s\n' "$_dir"
+			return 0
+		fi
+		_dir=$(dirname "$_dir")
+	done
+	return 1
+}
+
+# ---------------------------------------------------------------------------
+# 3. Detectar o engine — o único ponto que sabe a diferença entre os dois
+#
+# Podman primeiro, e não é preferência: existe um "docker" nesta máquina que é
+# wrapper do Podman (podman-docker). Procurá-lo antes deixaria o keep-id de
+# fora, e os arquivos do bind mount sairiam com dono errado.
+# ---------------------------------------------------------------------------
+
+doca_detect_engine() {
+	if command -v podman >/dev/null 2>&1; then
+		DOCA_ENGINE="podman"
+		DOCA_COMPOSE="podman-compose"
+		# keep-id amarra o seu UID do host ao mesmo UID lá dentro.
+		DOCA_USERNS="keep-id"
+		DOCKER_HOST="unix://${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/podman/podman.sock"
+		export DOCKER_HOST
+		return 0
+	fi
+
+	if command -v docker >/dev/null 2>&1; then
+		DOCA_ENGINE="docker"
+		DOCA_COMPOSE="docker compose"
+		# No Docker o mapeamento de UID já é direto e keep-id não existe.
+		# "host" equivale ao comportamento padrão, e evita passar string vazia.
+		DOCA_USERNS="host"
+		return 0
+	fi
+
+	doca_die "Nenhum engine de container encontrado. Instale o Podman ou o Docker."
+}
+
+# ---------------------------------------------------------------------------
+# 4. Guard de produção
+#
+# Mesmo bloqueio que os Makefiles já fazem hoje: se o ambiente declarado não
+# for development, morre antes de subir qualquer coisa.
+# ---------------------------------------------------------------------------
+
+doca_assert_development() {
+	_root=$1
+
+	for _file in "$_root/.env" "$_root/.env.local"; do
+		[ -f "$_file" ] || continue
+
+		# Linhas comentadas começam com # e não casam com o padrão.
+		_env=$(sed -n 's/^[[:space:]]*\(NODE_ENV\|NEXT_PUBLIC_APP_ENV\)[[:space:]]*=[[:space:]]*//p' "$_file" |
+			tr -d '"'\''\r ' | grep -v '^$' | head -1)
+
+		[ -n "$_env" ] || continue
+		[ "$_env" = "development" ] && continue
+
+		doca_die "BLOQUEADO: o doca é exclusivo de desenvolvimento.
+   $(basename "$_file") declara '$_env'."
+	done
+}
+
+# ---------------------------------------------------------------------------
+# 5. Contexto do projeto
+# ---------------------------------------------------------------------------
+
+doca_load_project() {
+	DOCA_ROOT=$(doca_find_root) ||
+		doca_die "Nenhum $DOCA_FILE encontrado aqui nem nas pastas acima.
+   Entre num projeto que tenha um $DOCA_FILE."
+
+	# O caminho do host, não o que o sandbox enxerga: é ele que vai no bind
+	# mount. (O /tmp do flatpak, por exemplo, não é o /tmp do host.)
+	DOCA_HOST_PATH=$(realpath "$DOCA_ROOT")
+	export DOCA_HOST_PATH
+
+	doca_assert_development "$DOCA_ROOT"
+	doca_detect_engine
+	export DOCA_USERNS
+
+	# O nome do projeto sai do "name:" do doca.yml e prefixa todos os volumes.
+	DOCA_PROJECT=$(sed -n 's/^name:[[:space:]]*//p' "$DOCA_ROOT/$DOCA_FILE" | head -1)
+	[ -n "$DOCA_PROJECT" ] ||
+		doca_die "O $DOCA_FILE precisa de um campo 'name:' no topo."
+}
+
+doca_compose() {
+	# shellcheck disable=SC2086
+	(cd "$DOCA_ROOT" && $DOCA_COMPOSE -f "$DOCA_FILE" "$@")
+}
+
+# ---------------------------------------------------------------------------
+# 6. Conferir que subiu de verdade
+#
+# O podman-compose 1.0.6 retorna 0 mesmo quando o container falha ao iniciar.
+# Sem esta conferência o doca anuncia "no ar" com tudo parado.
+# ---------------------------------------------------------------------------
+
+doca_assert_running() {
+	_broken=$($DOCA_ENGINE ps -a \
+		--filter "label=com.docker.compose.project=$DOCA_PROJECT" \
+		--format '{{.Names}}|{{.Status}}' 2>/dev/null | grep -v '|Up' || true)
+
+	[ -n "$_broken" ] || return 0
+
+	doca_die "Estes serviços não subiram:
+
+$(printf '%s\n' "$_broken" | sed 's/|/  →  /;s/^/   /')
+
+   Diagnóstico: doca logs"
+}
+
+# Traduz o erro mais provável (porta ocupada) em vez de despejar o traceback.
+doca_explain_failure() {
+	_out=$1
+
+	printf '%s' "$_out" | grep -q 'address already in use' || return 0
+
+	_port=$(printf '%s' "$_out" |
+		sed -n 's/.*listen tcp [0-9.]*:\([0-9]*\): bind.*/\1/p' | head -1)
+	_who=$($DOCA_ENGINE ps --format '{{.Names}}|{{.Ports}}' 2>/dev/null |
+		grep ":${_port}->" | cut -d'|' -f1 | head -1)
+
+	doca_die "A porta $_port já está em uso${_who:+ pelo container '$_who'}.
+   Se for o ambiente antigo (docker-compose.yaml), pare-o antes: make down"
+}
+
+# ---------------------------------------------------------------------------
+# 7. Esperar os serviços ficarem saudáveis
+#
+# O podman-compose 1.0.6 não tem --wait, e converte o
+# "depends_on: condition: service_healthy" em --requires, que só ordena o start
+# e não espera. Sem isto, o primeiro comando que tocar o banco falha.
+#
+# Três estados importam a cada ciclo: um container que morreu (Exited/Dead) ou
+# um healthcheck que desistiu (unhealthy) são falha imediata; um healthcheck
+# ainda em "starting" pede mais espera. Sem checar os dois primeiros, um
+# serviço que crasha durante o boot sai da contagem de "starting" e o doca
+# anunciaria "no ar" com ele parado.
+# ---------------------------------------------------------------------------
+
+doca_wait_healthy() {
+	_tries=90
+	_announced=0
+
+	while [ "$_tries" -gt 0 ]; do
+		_status=$($DOCA_ENGINE ps -a \
+			--filter "label=com.docker.compose.project=$DOCA_PROJECT" \
+			--format '{{.Names}}|{{.Status}}' 2>/dev/null)
+
+		_broken=$(printf '%s\n' "$_status" | grep -iE '\|(Exited|Dead)|unhealthy' || true)
+		if [ -n "$_broken" ]; then
+			doca_die "Um serviço não subiu:
+
+$(printf '%s\n' "$_broken" | sed 's/|/  →  /;s/^/   /')
+
+   Diagnóstico: doca logs"
+		fi
+
+		printf '%s\n' "$_status" | grep -q 'starting' || return 0
+
+		[ "$_announced" -eq 0 ] && {
+			doca_info "Aguardando os serviços ficarem prontos..."
+			_announced=1
+		}
+		sleep 1
+		_tries=$((_tries - 1))
+	done
+
+	doca_die "Os serviços não ficaram prontos a tempo. Veja: doca logs"
+}
+
+# ---------------------------------------------------------------------------
+# 8. Preparar o HOME do container
+#
+# Roda uma vez, no primeiro up. Escreve no volume "home": sobrevive a down e
+# rebuild, só o nuke apaga.
+#
+# Único ponto do script que assume uma stack (corepack existe em imagem Node).
+# Em imagem sem corepack o comando falha e é ignorado — o resto funciona igual.
+#
+# O --install-directory é obrigatório: por padrão o corepack escreve em
+# /usr/local/bin, que é do root, e com keep-id o processo é você (EACCES).
+# ---------------------------------------------------------------------------
+
+doca_prepare_home() {
+	doca_compose exec -T app sh -c '
+		set -e
+		[ -f /home/node/.local/bin/.doca-ready ] && exit 0
+
+		mkdir -p /home/node/.local/bin
+
+		# Deixa pnpm e yarn disponíveis; qual usar é escolha sua.
+		corepack enable --install-directory /home/node/.local/bin >/dev/null 2>&1 || true
+
+		# Stub: orienta em vez de dar "command not found". O ciclo de vida roda
+		# no host de propósito — o socket do engine aqui dentro seria uma fuga.
+		cat > /home/node/.local/bin/doca <<-STUB
+			#!/bin/sh
+			printf "\033[33m⚠ Você está DENTRO do container %s.\033[0m\n" "\$DOCA_INSIDE"
+			echo "  Comandos de ciclo de vida rodam no host."
+			echo "  Saia com '"'"'exit'"'"' e rode lá fora."
+			exit 1
+		STUB
+		chmod +x /home/node/.local/bin/doca
+
+		# Prompt que não deixa dúvida sobre onde você está.
+		cat > /home/node/.bashrc <<-RC
+			PS1="\[\033[01;36m\]\u@\$DOCA_INSIDE\[\033[00m\]:\[\033[01;33m\]\w\[\033[00m\]\\\$ "
+			alias ll="ls -lah"
+		RC
+
+		touch /home/node/.local/bin/.doca-ready
+	' >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
+# Comandos
+# ---------------------------------------------------------------------------
+
+doca_cmd_up() {
+	doca_load_project
+	doca_info "Subindo $DOCA_PROJECT ($DOCA_ENGINE)..."
+
+	# Guardamos a saída porque o exit code não é confiável (ver assert_running).
+	_out=$(doca_compose up -d "$@" 2>&1) || true
+
+	doca_explain_failure "$_out"
+	doca_assert_running
+	doca_wait_healthy
+	doca_prepare_home
+	doca_ok "$DOCA_PROJECT no ar."
+}
+
+# Perguntamos ao engine, não ao compose: o podman-compose 1.0.6 não conhece
+# "ps --services --filter", e o erro dele faria o doca subir tudo de novo a
+# cada entrada.
+doca_is_app_running() {
+	$DOCA_ENGINE ps \
+		--filter "label=com.docker.compose.project=$DOCA_PROJECT" \
+		--filter "label=com.docker.compose.service=app" \
+		--format '{{.Status}}' 2>/dev/null | grep -q '^Up'
+}
+
+doca_cmd_shell() {
+	doca_load_project
+
+	# Já está de pé? Entrar é instantâneo, sem recriar nada.
+	doca_is_app_running || doca_cmd_up
+
+	doca_compose exec app bash
+}
+
+doca_cmd_exec() {
+	doca_load_project
+	[ $# -gt 0 ] || doca_die "Uso: doca exec [-T] <serviço> <comando>"
+	doca_compose exec "$@"
+}
+
+doca_cmd_down() {
+	doca_load_project
+	doca_info "Parando $DOCA_PROJECT (volumes preservados)..."
+	doca_compose down >/dev/null 2>&1 || true
+	doca_ok "Parado. 'doca' traz de volta de onde parou."
+}
+
+# Sem pull de propósito: tag de imagem é alvo móvel, e puxar de novo trocaria
+# as versões sem você pedir. Para atualizar existe o 'update'.
+doca_cmd_rebuild() {
+	doca_load_project
+	doca_info "Recriando containers de $DOCA_PROJECT (volumes preservados)..."
+	doca_compose down >/dev/null 2>&1 || true
+	doca_cmd_up --force-recreate
+}
+
+# Separado do rebuild porque a consequência é grande: a mesma tag pode apontar
+# para outra versão amanhã, junto com as ferramentas que vêm na imagem. Aqui
+# você decide quando isso acontece.
+doca_cmd_update() {
+	doca_load_project
+	doca_info "Baixando imagens novas de $DOCA_PROJECT..."
+	doca_info "Atenção: as versões dentro do container podem mudar."
+	doca_compose down >/dev/null 2>&1 || true
+	doca_compose pull 2>&1 | grep -iE 'writing|error' | head -3 || true
+	doca_cmd_up --force-recreate
+}
+
+doca_cmd_logs() {
+	doca_load_project
+	doca_compose logs -f "$@"
+}
+
+doca_cmd_nuke() {
+	doca_load_project
+
+	printf 'Apagar o ambiente de \033[1m%s\033[0m? Containers e cache serão perdidos.\n' "$DOCA_PROJECT"
+	printf 'Seu código e o que está na pasta do projeto NÃO são tocados. [s/N] '
+	read -r _answer
+	case "$_answer" in
+	s | S | y | Y) ;;
+	*) doca_die "Cancelado." ;;
+	esac
+
+	doca_compose down >/dev/null 2>&1 || true
+
+	for _vol in $($DOCA_ENGINE volume ls \
+		--filter "label=com.docker.compose.project=$DOCA_PROJECT" \
+		--format '{{.Name}}' 2>/dev/null); do
+
+		# O volume "home" é só cache e store: reinstala baixando de novo.
+		# Qualquer outro carrega dado que custou caro (o dump de 1,2 GB, por
+		# exemplo). Esse pergunta antes.
+		case "$_vol" in
+		*_home)
+			$DOCA_ENGINE volume rm "$_vol" >/dev/null 2>&1 || true
+			doca_ok "cache removido ($_vol)"
+			;;
+		*)
+			printf 'Apagar também \033[1m%s\033[0m? Este tem DADOS. [s/N] ' "$_vol"
+			read -r _answer </dev/tty
+			case "$_answer" in
+			s | S | y | Y)
+				$DOCA_ENGINE volume rm "$_vol" >/dev/null 2>&1 || true
+				doca_ok "$_vol removido"
+				;;
+			*) doca_info "$_vol preservado" ;;
+			esac
+			;;
+		esac
+	done
+
+	doca_ok "Ambiente apagado. 'doca' reconstrói do zero."
+}
+
+doca_cmd_doctor() {
+	printf '\033[1mdoca %s\033[0m\n\n' "$DOCA_VERSION"
+
+	if [ -f /.flatpak-info ] && [ -z "${DOCA_ON_HOST:-}" ]; then
+		printf 'sandbox    flatpak (reexecutando no host)\n'
+	else
+		printf 'sandbox    nenhum\n'
+	fi
+
+	doca_detect_engine
+	printf 'engine     %s\n' "$($DOCA_ENGINE --version 2>&1 | head -1)"
+	printf 'compose    %s\n' "$($DOCA_COMPOSE --version 2>&1 | grep -i version | head -1)"
+	printf 'socket     %s\n' "${DOCKER_HOST:-(padrão do docker)}"
+	printf 'userns     %s\n' "$DOCA_USERNS"
+
+	# Sem estes controladores delegados, cpus/mem_limit viram enfeite.
+	_cg="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers"
+	if [ -r "$_cg" ]; then
+		printf 'cgroup     %s' "$(cat "$_cg")"
+		grep -q memory "$_cg" && printf ' \033[32m(limites valem)\033[0m'
+		printf '\n'
+	fi
+
+	if _root=$(doca_find_root 2>/dev/null); then
+		printf '\nprojeto    %s\n' "$_root"
+		printf 'arquivo    %s\n' "$DOCA_FILE"
+	else
+		printf '\nprojeto    (nenhum aqui — não achei um %s)\n' "$DOCA_FILE"
+	fi
+}
+
+# ---------------------------------------------------------------------------
+# Instalação
+#
+# O objetivo: formatou o PC? git clone, ./doca install, acabou. Você nunca
+# edita bash na mão — quem mexe é o script, e só entre as sentinelas, para
+# que o uninstall consiga desfazer exatamente o que foi feito.
+# ---------------------------------------------------------------------------
+
+doca_rc_file() {
+	# O install roda no host; o rc do host é quem importa.
+	if [ -f "$HOME/.bashrc" ]; then
+		printf '%s\n' "$HOME/.bashrc"
+	else
+		printf '%s\n' "$HOME/.profile"
+	fi
+}
+
+doca_cmd_install() {
+	mkdir -p "$DOCA_BIN_DIR"
+	ln -sf "$DOCA_SELF" "$DOCA_BIN_DIR/doca"
+	doca_ok "link criado: $DOCA_BIN_DIR/doca -> $DOCA_SELF"
+
+	_rc=$(doca_rc_file)
+
+	if grep -qF "$DOCA_MARK_START" "$_rc" 2>/dev/null; then
+		doca_ok "PATH já configurado em $(basename "$_rc")"
+	else
+		# No Zorin/Ubuntu, o ~/.local/bin só entra no PATH se a pasta já
+		# existir no momento do login. Como acabamos de criá-la, garantimos
+		# aqui em vez de mandar você reiniciar a sessão.
+		cat >>"$_rc" <<-RC
+
+			$DOCA_MARK_START
+			export PATH="\$HOME/.local/bin:\$PATH"
+			$DOCA_MARK_END
+		RC
+		doca_ok "PATH configurado em $(basename "$_rc")"
+	fi
+
+	printf '\n'
+	doca_info "Abra um terminal novo (ou: . $_rc) e rode 'doca doctor'."
+}
+
+doca_cmd_uninstall() {
+	rm -f "$DOCA_BIN_DIR/doca"
+	doca_ok "link removido"
+
+	_rc=$(doca_rc_file)
+	if grep -qF "$DOCA_MARK_START" "$_rc" 2>/dev/null; then
+		# Remove exatamente o bloco entre as sentinelas (inclusive). A linha
+		# em branco que o install escreve antes do bloco permanece. Nada
+		# mais é tocado.
+		_tmp="$_rc.doca-tmp"
+		sed "/^${DOCA_MARK_START}$/,/^${DOCA_MARK_END}$/d" "$_rc" >"$_tmp"
+		mv "$_tmp" "$_rc"
+		doca_ok "PATH removido de $(basename "$_rc")"
+	fi
+
+	printf '\n'
+	doca_info "O script continua em $(dirname "$DOCA_SELF") — apague a pasta se quiser."
+	doca_info "Containers e volumes dos projetos não foram tocados: use 'doca nuke' em cada um antes."
+}
+
+# ---------------------------------------------------------------------------
+
+# printf e não cat: o heredoc não interpreta os \033 das cores.
+doca_cmd_help() {
+	printf '\033[1mdoca %s\033[0m — ambiente de desenvolvimento em container\n' "$DOCA_VERSION"
+	printf '
+\033[1mUSO\033[0m
+  doca [comando]
+
+  Sem comando: sobe o que falta e abre um shell dentro do projeto.
+  Projeto = pasta com um %s (procura também nas pastas acima).
+
+\033[1mDIA A DIA\033[0m
+  doca                 entra no projeto
+  doca exec S CMD      roda CMD no serviço S, sem entrar
+  doca logs [S]        acompanha os logs
+  doca down            para tudo \033[2m— volumes preservados\033[0m
+
+\033[1mMANUTENÇÃO\033[0m
+  doca up              sobe, mas não entra
+  doca rebuild         recria os containers \033[2m— volumes preservados\033[0m
+  doca update          baixa imagens novas \033[2m— pode trocar versões\033[0m
+  doca nuke            apaga o ambiente \033[2m— pergunta antes dos dados\033[0m
+  doca doctor          engine, socket, limites e projeto detectados
+
+\033[1mNA MÁQUINA\033[0m
+  doca install         cria ~/.local/bin/doca e ajusta o PATH no shell rc
+  doca uninstall       desfaz o install \033[2m— não toca em containers\033[0m
+
+\033[1mEXEMPLOS\033[0m
+  doca exec app pnpm install
+  doca exec -T mysql mysqldump -u root -pSENHA base > dump.sql
+
+\033[1mBOM SABER\033[0m
+  • A 1a instalação é ./doca install — ainda não há atalho no PATH.
+  • "exit" sai do shell, mas o ambiente segue ligado: use doca down.
+  • Gerenciar é aqui fora; lá dentro você só trabalha.
+  • Nenhum comando apaga seu código ou a pasta do projeto.
+  • Moveu a pasta do doca? Rode ./doca install no novo local.
+' "$DOCA_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Entrada
+# ---------------------------------------------------------------------------
+
+# Caminho real de si mesmo, com symlink resolvido: usado no respawn e no link
+# do install. Sem resolver, um "doca install" chamado pelo PATH criaria um
+# symlink apontando para si mesmo.
+DOCA_SELF=$(readlink -f "$0" 2>/dev/null) || DOCA_SELF=$0
+[ -n "$DOCA_SELF" ] || DOCA_SELF=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+
+doca_respawn_on_host "$@"
+
+case "${1:-}" in
+"") doca_cmd_shell ;;
+exec)
+	shift
+	doca_cmd_exec "$@"
+	;;
+up)
+	shift
+	doca_cmd_up "$@"
+	;;
+down) doca_cmd_down ;;
+rebuild) doca_cmd_rebuild ;;
+update) doca_cmd_update ;;
+logs)
+	shift
+	doca_cmd_logs "$@"
+	;;
+nuke) doca_cmd_nuke ;;
+doctor) doca_cmd_doctor ;;
+install) doca_cmd_install ;;
+uninstall) doca_cmd_uninstall ;;
+help | -h | --help) doca_cmd_help ;;
+*) doca_die "Comando desconhecido: $1
+   Veja: doca help" ;;
+esac
