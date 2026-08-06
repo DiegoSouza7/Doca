@@ -286,9 +286,26 @@ doca_prepare_home() {
 # Comandos
 # ---------------------------------------------------------------------------
 
+# Container que existe mas está parado (o que o 'stop' deixa para trás).
+# Perguntamos ao engine pelo mesmo motivo do is_app_running logo abaixo.
+doca_has_stopped_containers() {
+	$DOCA_ENGINE ps -a \
+		--filter "label=com.docker.compose.project=$DOCA_PROJECT" \
+		--format '{{.Status}}' 2>/dev/null | grep -q '^Exited'
+}
+
 doca_cmd_up() {
 	doca_load_project
 	doca_info "Subindo $DOCA_PROJECT ($DOCA_ENGINE)..."
+
+	# Containers parados pelo 'stop' religam com start, que não os recria. O
+	# up -d em seguida cobre o que porventura não exista e é no-op para o que
+	# já subiu — assim não dependemos do podman-compose 1.0.6 acertar o
+	# religar sozinho. Com argumento (--force-recreate do rebuild/update) o
+	# pedido é justamente recriar: aí o start ficaria no caminho.
+	if [ $# -eq 0 ] && doca_has_stopped_containers; then
+		doca_compose start >/dev/null 2>&1 || true
+	fi
 
 	# Guardamos a saída porque o exit code não é confiável (ver assert_running).
 	_out=$(doca_compose up -d "$@" 2>&1) || true
@@ -325,11 +342,20 @@ doca_cmd_exec() {
 	doca_compose exec "$@"
 }
 
+# Diferente do down: os containers continuam existindo, então o que foi feito
+# dentro deles sobrevive e o religar é imediato.
+doca_cmd_stop() {
+	doca_load_project
+	doca_info "Pausando $DOCA_PROJECT (containers preservados)..."
+	doca_compose stop >/dev/null 2>&1 || true
+	doca_ok "Pausado. 'doca' religa em segundos."
+}
+
 doca_cmd_down() {
 	doca_load_project
-	doca_info "Parando $DOCA_PROJECT (volumes preservados)..."
+	doca_info "Apagando os containers de $DOCA_PROJECT (volumes preservados)..."
 	doca_compose down >/dev/null 2>&1 || true
-	doca_ok "Parado. 'doca' traz de volta de onde parou."
+	doca_ok "Containers apagados. 'doca' cria novos; seus volumes continuam lá."
 }
 
 # Sem pull de propósito: tag de imagem é alvo móvel, e puxar de novo trocaria
@@ -510,7 +536,8 @@ doca_cmd_help() {
   doca                 entra no projeto
   doca exec S CMD      roda CMD no serviço S, sem entrar
   doca logs [S]        acompanha os logs
-  doca down            para tudo \033[2m— volumes preservados\033[0m
+  doca stop            pausa tudo \033[2m— containers preservados\033[0m
+  doca down            apaga os containers \033[2m— volumes preservados\033[0m
 
 \033[1mMANUTENÇÃO\033[0m
   doca up              sobe, mas não entra
@@ -529,7 +556,9 @@ doca_cmd_help() {
 
 \033[1mBOM SABER\033[0m
   • A 1a instalação é ./doca install — ainda não há atalho no PATH.
-  • "exit" sai do shell, mas o ambiente segue ligado: use doca down.
+  • "exit" sai do shell, mas o ambiente segue ligado: use doca stop.
+  • stop pausa e religa em segundos; down APAGA os containers e a próxima
+    subida cria novos — nos dois, volumes e código ficam intactos.
   • Gerenciar é aqui fora; lá dentro você só trabalha.
   • Nenhum comando apaga seu código ou a pasta do projeto.
   • Moveu a pasta do doca? Rode ./doca install no novo local.
@@ -558,6 +587,7 @@ up)
 	shift
 	doca_cmd_up "$@"
 	;;
+stop) doca_cmd_stop ;;
 down) doca_cmd_down ;;
 rebuild) doca_cmd_rebuild ;;
 update) doca_cmd_update ;;

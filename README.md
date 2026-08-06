@@ -38,8 +38,8 @@ terminal: bash do sistema, VSCode, Cursor, e também dentro do **VSCode Flatpak*
 ## O que o doca resolve
 
 **Você entra no ambiente com um comando.** `doca` sobe os containers, espera os serviços ficarem
-prontos e te entrega um shell dentro do projeto. Sair (`exit`) não desliga nada; `doca down`
-desliga quando você quiser.
+prontos e te entrega um shell dentro do projeto. Sair (`exit`) não desliga nada; `doca stop`
+pausa e `doca down` apaga os containers (seus volumes ficam) quando você quiser.
 
 **A versão da linguagem é a que você declara — e não muda sozinha.** O `doca.yml` fixa a imagem
 (`node:22`, por exemplo), e uma trava impede que o gerenciador de pacotes seja baixado da
@@ -155,7 +155,8 @@ não são tocados — rode `doca nuke` em cada projeto antes, se quiser limpar t
 | `exit` | Sai do shell. **O ambiente continua ligado** |
 | `doca exec S CMD` | Roda `CMD` no serviço `S` e sai |
 | `doca logs [S]` | Acompanha os logs |
-| `doca down` | Para tudo — **volumes preservados** |
+| `doca stop` | Pausa tudo — **containers preservados** |
+| `doca down` | **Apaga os containers** — volumes preservados |
 | `doca up` | Sobe sem entrar |
 | `doca rebuild` | Recria os containers com a imagem que já está na máquina |
 | `doca update` | Baixa imagens novas — **pode trocar versões** |
@@ -172,8 +173,23 @@ pnpm install
 pnpm dev              # acesse na porta que o doca.yml publica
 # Ctrl+C
 exit                  # saiu; o ambiente continua ligado
-doca down             # desligou
+doca stop             # pausou; amanhã o `doca` religa em segundos
 ```
+
+### `stop` vs `down`
+
+Os dois desligam o ambiente e nenhum dos dois toca em volume, código ou `node_modules`. A
+diferença é o que acontece com o container em si — e ela é grande:
+
+- **`stop`** só **para** os containers; eles continuam existindo. Religar (`doca`) leva segundos e
+  você encontra tudo como deixou, inclusive o que instalou lá dentro fora dos volumes (um
+  `apt install`, um arquivo em `/tmp`). É o desligar do dia a dia.
+- **`down`** **apaga** os containers — não é só parar. A próxima subida cria containers novos a
+  partir da imagem, e o que estava dentro do container fora dos volumes se perde. **Os volumes
+  sobrevivem** (banco, cache, store do pnpm), assim como seu código. Use quando quiser um
+  container limpo ou depois de mexer no `doca.yml`.
+
+Na dúvida, `stop`. O `down` é para quando você quer o container do zero.
 
 ### `rebuild` vs `update`
 
@@ -188,11 +204,18 @@ São separados de propósito:
 ### Ciclo de vida
 
 ```
-   NÃO EXISTE  ──────( doca )──────▶  LIGADO  ⇄  DESLIGADO
+                                      PAUSADO
+                                         ⇅  ( doca stop / doca )
+   NÃO EXISTE  ──────( doca )──────▶  LIGADO  ⇄  SEM CONTAINERS
         ▲                                   ( doca down / doca )
         │
         └──────────( doca nuke )────────────┘
 ```
+
+**PAUSADO**: os containers existem, só estão parados. **SEM CONTAINERS**: o `down` apagou os
+containers e **manteve os volumes** — a próxima subida cria containers novos com os mesmos dados.
+**NÃO EXISTE**: nem containers, nem volumes (só o `nuke` chega aqui, e ele pergunta antes).
+Ver [`stop` vs `down`](#stop-vs-down).
 
 **Nunca afetado por nenhum comando:** seu código, `node_modules`, artefatos de build, arquivos
 de ambiente e o `.git`. Nada disso é volume — está tudo no seu disco.
