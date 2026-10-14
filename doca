@@ -4,14 +4,16 @@
 # Um comando e você está dentro do projeto, de qualquer terminal (bash, Cursor,
 # VSCode flatpak). Projeto = qualquer pasta com um doca.yml.
 #
-# Divisão: o doca cuida do que depende da máquina (sandbox, engine, caminhos,
-# ciclo de vida). Imagem, versões, recursos e serviços são do doca.yml.
+# Divisão: o doca cuida do que depende da máquina e do produto (sandbox,
+# engine, SELinux, userns, bind do código, cache, ciclo de vida). Imagem,
+# versões, recursos e serviços são do doca.yml — que não cita nada disso, e
+# por isso o mesmo arquivo vale no Zorin, no Fedora e no Bazzite.
 #
 # Instalação: ./doca install     Remoção: doca uninstall
 
 set -eu
 
-DOCA_VERSION="1.0.0"
+DOCA_VERSION="1.1.0"
 DOCA_FILE="doca.yml"
 DOCA_BIN_DIR="$HOME/.local/bin"
 
@@ -103,6 +105,19 @@ doca_detect_engine() {
 	doca_die "Nenhum engine de container encontrado. Instale o Podman ou o Docker."
 }
 
+# Fedora/Bazzite: sem rótulo, o SELinux nega ao container a leitura da pasta do
+# projeto (EACCES no package.json). :z (compartilhado, não :Z) para o editor e
+# o git do host continuarem lendo. Ubuntu/Zorin não têm SELinux: nada muda.
+doca_selinux_enforcing() {
+	[ "$(cat /sys/fs/selinux/enforce 2>/dev/null)" = 1 ]
+}
+
+doca_host_timezone() {
+	_tz=$(timedatectl show --property=Timezone --value 2>/dev/null || true)
+	[ -n "$_tz" ] || _tz=$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')
+	printf '%s\n' "${_tz:-UTC}"
+}
+
 # ---------------------------------------------------------------------------
 # 4. Guard de produção
 #
@@ -133,6 +148,9 @@ doca_assert_development() {
 # ---------------------------------------------------------------------------
 
 doca_load_project() {
+	# shell → up e rebuild → up chamam de novo: um overlay por execução basta.
+	[ -z "${DOCA_ROOT:-}" ] || return 0
+
 	DOCA_ROOT=$(doca_find_root) ||
 		doca_die "Nenhum $DOCA_FILE encontrado aqui nem nas pastas acima.
    Entre num projeto que tenha um $DOCA_FILE."
@@ -150,11 +168,79 @@ doca_load_project() {
 	DOCA_PROJECT=$(sed -n 's/^name:[[:space:]]*//p' "$DOCA_ROOT/$DOCA_FILE" | head -1)
 	[ -n "$DOCA_PROJECT" ] ||
 		doca_die "O $DOCA_FILE precisa de um campo 'name:' no topo."
+
+	# Formato antigo: o próprio YAML monta o código via ${DOCA_HOST_PATH}.
+	# Injetar por cima duplicaria o /workspace; ele roda como sempre rodou.
+	if grep -q '^[^#]*DOCA_HOST_PATH' "$DOCA_ROOT/$DOCA_FILE"; then
+		DOCA_LEGACY=1
+		return 0
+	fi
+
+	# O podman-compose 1.0.6 (apt do Zorin) dá realpath em cada -f: /dev/fd,
+	# stdin e <(...) viram "pipe:[...]" e não abrem. Precisa ser arquivo de
+	# verdade — fora do projeto, e some quando o doca termina.
+	DOCA_OVERLAY=$(mktemp "${TMPDIR:-/tmp}/doca.XXXXXX")
+	trap 'rm -f "$DOCA_OVERLAY"' EXIT
+	trap 'exit 130' INT TERM HUP
+	doca_overlay >"$DOCA_OVERLAY"
+}
+
+# O que o doca.yml não cita: tudo que depende da máquina ou do produto.
+# Mesclado pelo próprio Compose como um segundo -f.
+doca_overlay() {
+	_bind="$DOCA_HOST_PATH:/workspace"
+	doca_selinux_enforcing && _bind="$_bind:z"
+	_tz=$(doca_host_timezone)
+
+	# Só o app ganha userns: é o único que escreve na sua pasta. Os demais
+	# usam a imagem como ela é — os entrypoints oficiais (mysql, rabbitmq)
+	# começam como root e acertam o dono do próprio volume. Com keep-id eles
+	# rodariam como o seu UID e não leriam o volume que já existe.
+	cat <<-EOF
+		services:
+		  app:
+		    hostname: $DOCA_PROJECT
+		    userns_mode: $DOCA_USERNS
+		    working_dir: /workspace
+		    # O container não é a aplicação: fica de pé e quem digita é você.
+		    command: sleep infinity
+		    environment:
+		      TZ: $_tz
+		      DOCA_INSIDE: $DOCA_PROJECT
+		      # Inteiro: o Compose substitui a variável, não soma. O prefixo é
+		      # onde o corepack instala os shims (ver doca_prepare_home).
+		      PATH: /home/node/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+		      # A trava: sem ela o corepack baixa o gerenciador mais recente
+		      # publicado, sem checar se serve para este Node.
+		      COREPACK_DEFAULT_TO_LATEST: "0"
+		      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+		      # Store fora do projeto. O pnpm até a 10 lê npm_config_*; a 11
+		      # só lê pnpm_config_* e, sem ela, cria .pnpm-store no /workspace.
+		      npm_config_store_dir: /home/node/.pnpm-store
+		      pnpm_config_store_dir: /home/node/.pnpm-store
+		      PNPM_HOME: /home/node/.pnpm
+		      XDG_CACHE_HOME: /home/node/.cache
+		      XDG_DATA_HOME: /home/node/.local/share
+		      npm_config_cache: /home/node/.npm
+		      YARN_CACHE_FOLDER: /home/node/.yarn
+		    volumes:
+		      # Código, node_modules e build/ ficam no seu disco.
+		      - "$_bind"
+		      - home:/home/node
+	EOF
+
+	# A lista vem do próprio Compose, que entende o YAML de verdade.
+	for _svc in $(cd "$DOCA_ROOT" && $DOCA_COMPOSE -f "$DOCA_FILE" config --services 2>/dev/null); do
+		[ "$_svc" = app ] && continue
+		printf '  %s:\n    environment:\n      TZ: %s\n' "$_svc" "$_tz"
+	done
+
+	printf 'volumes:\n  home:\n'
 }
 
 doca_compose() {
 	# shellcheck disable=SC2086
-	(cd "$DOCA_ROOT" && $DOCA_COMPOSE -f "$DOCA_FILE" "$@")
+	(cd "$DOCA_ROOT" && $DOCA_COMPOSE -f "$DOCA_FILE" ${DOCA_OVERLAY:+-f "$DOCA_OVERLAY"} "$@")
 }
 
 # ---------------------------------------------------------------------------
@@ -296,6 +382,8 @@ doca_has_stopped_containers() {
 
 doca_cmd_up() {
 	doca_load_project
+	[ -z "${DOCA_LEGACY:-}" ] ||
+		doca_info "$DOCA_FILE no formato antigo: roda como antes, sem :z nem TZ do host. Veja 'Migrando' no README."
 	doca_info "Subindo $DOCA_PROJECT ($DOCA_ENGINE)..."
 
 	# Containers parados pelo 'stop' religam com start, que não os recria. O
@@ -437,9 +525,15 @@ doca_cmd_doctor() {
 
 	doca_detect_engine
 	printf 'engine     %s\n' "$($DOCA_ENGINE --version 2>&1 | head -1)"
-	printf 'compose    %s\n' "$($DOCA_COMPOSE --version 2>&1 | grep -i version | head -1)"
+	printf 'compose    %s\n' "$($DOCA_COMPOSE --version 2>&1 | grep -i compose | head -1)"
 	printf 'socket     %s\n' "${DOCKER_HOST:-(padrão do docker)}"
-	printf 'userns     %s\n' "$DOCA_USERNS"
+	printf 'userns     %s (só no app)\n' "$DOCA_USERNS"
+	if doca_selinux_enforcing; then
+		printf 'selinux    enforcing (bind do código com :z)\n'
+	else
+		printf 'selinux    não aplica\n'
+	fi
+	printf 'fuso       %s\n' "$(doca_host_timezone)"
 
 	# Sem estes controladores delegados, cpus/mem_limit viram enfeite.
 	_cg="/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.controllers"
@@ -452,6 +546,9 @@ doca_cmd_doctor() {
 	if _root=$(doca_find_root 2>/dev/null); then
 		printf '\nprojeto    %s\n' "$_root"
 		printf 'arquivo    %s\n' "$DOCA_FILE"
+		if grep -q '^[^#]*DOCA_HOST_PATH' "$_root/$DOCA_FILE"; then
+			printf '\033[33mformato    antigo (o YAML monta o código) — veja Migrando no README\033[0m\n'
+		fi
 	else
 		printf '\nprojeto    (nenhum aqui — não achei um %s)\n' "$DOCA_FILE"
 	fi
