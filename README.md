@@ -11,11 +11,12 @@ doca
 ```
 node@meu-projeto:/workspace$ node --version
 v22.21.1
-node@meu-projeto:/workspace$ pnpm install     # escreve no container, não no seu PC
+node@meu-projeto:/workspace$ pnpm install     # roda no container; o node_modules fica na sua pasta
 ```
 
-Um script `sh` de ~550 linhas, sem dependências além do Podman ou Docker. Funciona em qualquer
-terminal: bash do sistema, VSCode, Cursor, e também dentro do **VSCode Flatpak**.
+Um único script POSIX `sh`. Precisa do Podman + `podman-compose` (preferido) ou, só na falta do
+Podman, do Docker + Docker Compose. Funciona em qualquer terminal: bash do sistema, VSCode,
+Cursor, e também dentro do **VSCode Flatpak**.
 
 ---
 
@@ -29,9 +30,9 @@ terminal: bash do sistema, VSCode, Cursor, e também dentro do **VSCode Flatpak*
 - [Convenções obrigatórias](#convenções-obrigatórias)
 - [Exemplos](#exemplos)
 - [Como funciona](#como-funciona)
-- [Migrando do formato antigo](#migrando-do-formato-antigo)
 - [Segurança](#segurança)
 - [Problemas comuns](#problemas-comuns)
+- [O que mudou entre versões](#o-que-mudou-entre-versões)
 - [Licença](#licença)
 
 ---
@@ -60,8 +61,8 @@ cada um com seu limite de CPU e memória, seus serviços (MySQL, RabbitMQ...) e 
 **Roda de qualquer terminal, inclusive VSCode Flatpak.** O script atravessa o sandbox sozinho —
 você não configura nada para isso.
 
-**Funciona com Podman ou Docker sem você escolher.** Ele detecta qual está na máquina e se
-adapta. Trocar de engine não pede mudança nenhuma no projeto.
+**Usa o Podman sempre que ele existe.** O Docker só entra se não houver Podman na máquina. A
+detecção é automática, e o `doca.yml` é o mesmo nos dois casos.
 
 A ideia é uma divisão de responsabilidades:
 
@@ -78,14 +79,24 @@ o script.
 
 ## Requisitos
 
-- **Linux** — testado em Zorin OS 18 / Ubuntu 24.04 (podman-compose 1.0.6 do apt) e em
-  Bazzite 44 / Fedora (podman-compose 1.6 via Homebrew, SELinux em enforcing)
-- **Podman** (rootless, recomendado) + `podman-compose`, **ou** **Docker** + Docker Compose.
-  Em distro imutável (Bazzite, Silverblue), instale o `podman-compose` pelo `brew` — nada vai
-  para `/usr`
+- **Linux**
+- **Podman** (rootless) + `podman-compose`. Com o Podman instalado, o `podman-compose` é
+  obrigatório: o `doca` usa o Podman mesmo que o Docker também exista, e não recorre ao
+  `docker compose`. Em distro imutável (Bazzite, Silverblue), instale o `podman-compose` pelo
+  `brew` — nada vai para `/usr`
+- **Docker** + Docker Compose, só se a máquina não tiver Podman
 - **cgroups v2** com controladores delegados, para que os limites de CPU/memória valham
 
 Não precisa de Node, Python ou qualquer runtime instalado no host.
+
+### Onde foi testado
+
+Todos os testes foram feitos com **Podman rootless** e com imagens prontas (`image:`):
+
+| Sistema | podman-compose |
+|---|---|
+| Zorin OS 18.1 / Ubuntu 24.04 | 1.0.6 (apt) |
+| Bazzite 44 / Fedora, SELinux em enforcing | 1.6 (Homebrew) |
 
 Confira tudo de uma vez com `doca doctor`:
 
@@ -110,7 +121,7 @@ arquivo    doca.yml
 ## Instalação
 
 ```bash
-git clone https://github.com/SEU_USUARIO/doca.git ~/ferramentas/doca
+git clone https://github.com/DiegoSouza7/Doca.git ~/ferramentas/doca
 cd ~/ferramentas/doca
 ./doca install
 ```
@@ -123,7 +134,7 @@ Exatamente duas coisas, ambas dentro do seu `$HOME`:
 
 1. Cria o atalho `~/.local/bin/doca` apontando para o script (criando `~/.local/bin` se não
    existir).
-2. Acrescenta um bloco ao seu `~/.bashrc`:
+2. Acrescenta um bloco ao seu `~/.bashrc` (ou ao `~/.profile`, se não houver `~/.bashrc`):
 
 ```bash
 # >>> doca >>>
@@ -166,8 +177,8 @@ não são tocados — rode `doca nuke` em cada projeto antes, se quiser limpar t
 | `doca stop` | Pausa tudo — **containers preservados** |
 | `doca down` | **Apaga os containers** — volumes preservados |
 | `doca up` | Sobe sem entrar |
-| `doca rebuild` | Recria os containers com a imagem que já está na máquina |
-| `doca update` | Baixa imagens novas — **pode trocar versões** |
+| `doca rebuild` | Recria os containers com a imagem que já está na máquina, sem entrar |
+| `doca update` | Apaga os containers, baixa imagens novas e sobe — **pode trocar versões** |
 | `doca nuke` | Apaga o ambiente — pergunta antes dos dados |
 | `doca doctor` | Diagnóstico: engine, socket, limites, projeto |
 | `doca help` | Ajuda completa |
@@ -195,19 +206,34 @@ diferença é o que acontece com o container em si — e ela é grande:
 - **`down`** **apaga** os containers — não é só parar. A próxima subida cria containers novos a
   partir da imagem, e o que estava dentro do container fora dos volumes se perde. **Os volumes
   sobrevivem** (banco, cache, store do pnpm), assim como seu código. Use quando quiser um
-  container limpo ou depois de mexer no `doca.yml`.
+  container limpo ou depois de mexer no `doca.yml` (ver
+  [Editou o `doca.yml`?](#editou-o-docayml)).
 
 Na dúvida, `stop`. O `down` é para quando você quer o container do zero.
+
+### Editou o `doca.yml`?
+
+```bash
+doca down && doca
+```
+
+O `doca` com o ambiente de pé só entra no shell — não relê o `doca.yml`. O `down` apaga os
+containers, e a próxima subida cria containers novos já com o arquivo editado.
 
 ### `rebuild` vs `update`
 
 São separados de propósito:
 
-- **`rebuild`** recria os containers com a imagem que já está na máquina. Use depois de editar
-  o `doca.yml`.
-- **`update`** baixa imagens novas. Uma etiqueta como `node:22` é **alvo móvel**: hoje aponta
-  para 22.21.1, semana que vem para 22.23.1 — e o pnpm que vem embutido muda junto. Por isso
-  atualizar é um ato explícito, para você controlar quando as versões mudam.
+- **`rebuild`** faz `down` e sobe de novo forçando a recriação, **sem baixar nada**: usa a
+  imagem que já está na máquina. O efeito é o mesmo de `doca down && doca up`.
+- **`update`** faz `down`, **baixa as imagens de novo** (`pull`) e sobe. Uma etiqueta como
+  `node:22` é **alvo móvel**: hoje aponta para 22.21.1, semana que vem para 22.23.1 — e o pnpm
+  que vem embutido muda junto. Por isso atualizar é um ato explícito, para você controlar quando
+  as versões mudam.
+
+Nenhum dos dois reconstrói imagem de `build:` — o `doca` não passa `--build` ao Compose. Se o
+seu `doca.yml` usa `build:` com um `Dockerfile`, a imagem montada da primeira vez continua
+sendo usada. O `doca` foi testado só com imagens prontas (`image:`), e é o recomendado.
 
 ### Ciclo de vida
 
@@ -267,7 +293,7 @@ do projeto. (Tem que ser arquivo: o podman-compose 1.0.6 não lê `/dev/fd` nem 
 |---|---|---|
 | Bind do código | `<pasta real>:/workspace` (`:z` com SELinux) | Código e `node_modules` ficam no seu disco, para o editor enxergar |
 | `home:/home/node` | volume | Cache, store do pnpm e histórico fora do seu disco |
-| `userns_mode` | `keep-id` no Podman, `host` no Docker | Arquivos criados pelo container saem com o **seu** dono |
+| `userns_mode` | `keep-id` no Podman, `host` no Docker | No Podman, o processo roda com o seu UID e os arquivos criados pelo container saem com o **seu** dono. No Docker, o `doca` não define `user:` — vale o usuário padrão da imagem |
 | `command` | `sleep infinity` | O container **não roda a aplicação**: fica de pé esperando você. Quem roda `pnpm dev` é você |
 | `working_dir`, `hostname` | `/workspace`, o `name:` | |
 | `PATH` | começa com `/home/node/.local/bin` | Onde o corepack instala pnpm/yarn |
@@ -326,9 +352,20 @@ qualquer outro é dado e pergunta antes.
 
 ## Convenções obrigatórias
 
-O `doca` espera três coisas do seu `doca.yml`. Elas não são configuráveis hoje.
+O `doca` espera quatro coisas do seu `doca.yml`. Elas não são configuráveis hoje.
 
-### 1. O serviço principal chama-se `app`
+### 1. Um `name:` no topo, sem aspas nem comentário
+
+```yaml
+name: meu-projeto
+```
+
+O `doca` lê a primeira linha que começa com `name:` e usa o resto dela **literalmente** — é com
+esse valor que ele acha os containers e volumes do projeto. `name: "meu-projeto"` ou
+`name: meu-projeto  # api` levam as aspas ou o comentário junto, e os comandos deixam de
+encontrar o ambiente. Sem `name:`, o `doca` recusa rodar.
+
+### 2. O serviço principal chama-se `app`
 
 ```yaml
 services:
@@ -338,13 +375,13 @@ services:
 É o serviço em que `doca` entra e onde `doca exec app ...` roda. Os outros serviços podem ter
 qualquer nome.
 
-### 2. O `HOME` do container é `/home/node`
+### 3. O `HOME` do container é `/home/node`
 
 O `doca` monta o volume `home` em `/home/node` e é ali que instala os atalhos do corepack,
 escreve o `.bashrc` e guarda o cache. Imagens oficiais do Node já têm o usuário `node` (UID
 1000) com esse HOME.
 
-### 3. A imagem tem `bash`
+### 4. A imagem tem `bash`
 
 `doca` abre o shell com `bash`. Imagens Alpine não o têm por padrão — use as variantes Debian
 (`node:22`, não `node:22-alpine`), ou instale o `bash` na imagem.
@@ -366,8 +403,8 @@ A pasta [`exemplos/`](exemplos/) tem arquivos completos e copiáveis:
 | [`api-multi-servicos.yml`](exemplos/api-multi-servicos.yml) | API + MySQL + Redis + RabbitMQ |
 
 Copie para a raiz do projeto como `doca.yml` e ajuste o `name:`, a imagem e as portas.
-Os três passam no `config` do podman-compose 1.0.6 e 1.6 e do Docker Compose, já mesclados
-com o overlay do `doca`.
+Os três passam no `config` do podman-compose 1.0.6 e 1.6, já mesclados com o overlay do
+`doca`.
 
 ### Como os serviços se enxergam
 
@@ -440,17 +477,23 @@ Procura **Podman primeiro**, depois Docker. A ordem importa: em muitas distros e
 encontraria o wrapper, concluiria "é Docker" e deixaria o `keep-id` de fora — e aí todo arquivo
 criado pelo container sairia com dono errado, impossível de editar.
 
+Achando o Podman, o compose é sempre o `podman-compose` — o `docker compose` não é usado,
+mesmo que esteja instalado. O Docker (com `docker compose`) só entra quando não há Podman.
+
 Esse é o **único** ponto do script que conhece a diferença entre os dois engines.
 
 ### Sandbox (Flatpak)
 
-Se detecta que está dentro de um sandbox, o script **se reexecuta no host** e sai. É uma linha,
-no topo. Todo o resto é escrito como se Flatpak não existisse — e dentro do container também
-não existe.
+Se encontra `/.flatpak-info`, o script **se reexecuta no host** com `flatpak-spawn --host`, na
+mesma pasta, e sai. Todo o resto é escrito como se Flatpak não existisse — e dentro do
+container também não existe.
 
 Isso importa mais do que parece: o `/tmp` que o VSCode Flatpak enxerga **não é** o `/tmp` do
-sistema. São dois mundos com o mesmo nome. Por isso o script resolve o caminho real do projeto
-(`realpath`) antes de entregá-lo ao engine.
+sistema. São dois mundos com o mesmo nome. Como o script já roda no host quando entrega o
+caminho ao engine, o caminho é o do host.
+
+Antes de entregá-lo, o script ainda resolve o caminho real do projeto com `realpath`. É o que
+transforma `/home/...` em `/var/home/...` no Fedora/Bazzite (ver a tabela abaixo).
 
 ### Debian × Fedora
 
@@ -477,7 +520,8 @@ Sem ele, os entrypoints oficiais começam como root e acertam o dono do volume s
 
 ### Guard de produção
 
-Antes de subir, o `doca` lê `.env` e `.env.local` procurando `NODE_ENV` ou
+Em **todo comando de projeto** (`doca`, `up`, `exec`, `logs`, `stop`, `down`, `rebuild`,
+`update`, `nuke`), o `doca` lê `.env` e `.env.local` procurando `NODE_ENV` ou
 `NEXT_PUBLIC_APP_ENV`. Se algum declarar algo diferente de `development`, ele recusa:
 
 ```
@@ -485,81 +529,98 @@ Antes de subir, o `doca` lê `.env` e `.env.local` procurando `NODE_ENV` ou
    .env declara 'production'.
 ```
 
-Linhas comentadas são ignoradas. O guard só age ao subir — se você precisa simular produção,
-`export NODE_ENV=production` **dentro** do container funciona normalmente.
+Isso vale também para `stop`, `down` e `nuke`: com o `.env` em `production`, nenhum deles
+roda. Volte o valor para `development` antes de gerenciar o ambiente. `doctor`, `help`,
+`install` e `uninstall` não passam pelo guard.
+
+Como a leitura funciona:
+
+- Só conta a linha que **começa** com a variável (espaços antes são aceitos). Linhas comentadas
+  (`# NODE_ENV=...`) e linhas com `export` na frente não são lidas.
+- Do valor saem aspas e espaços, e o resto é comparado com `development` **literalmente**. Um
+  comentário no fim da linha (`NODE_ENV=development # local`) vira `development#local` e
+  bloqueia.
+
+Se você precisa simular produção, `export NODE_ENV=production` **dentro** do container funciona
+normalmente — o guard só lê os arquivos.
 
 ### Contornos do podman-compose
 
-O `podman-compose` 1.0.6 implementa o Compose só parcialmente. O `doca` contorna três coisas
-para você não precisar saber que elas existem:
+O `podman-compose` 1.0.6 implementa o Compose só parcialmente. O `doca` contorna estas coisas
+para você não precisar saber que elas existem. Os contornos rodam com qualquer engine, não só
+com o Podman:
 
 | Recurso | Comportamento no podman-compose | Contorno |
 |---|---|---|
-| `up --wait` | Não existe | Espera manual até nenhum container estar `starting` |
+| `up --wait` | Não existe | Espera manual: consulta o engine a cada segundo até nenhum container estar `starting` |
 | `depends_on: service_healthy` | Vira `--requires`, que só ordena o start e **não espera a saúde** | Mesma espera manual |
-| Código de saída | Devolve `0` mesmo quando o container falha ao iniciar | Confere o estado real via `podman ps` |
+| Código de saída | Devolve `0` mesmo quando o container falha ao iniciar | Confere o estado real via `ps` do engine |
+| Religar depois do `stop` | Não é confiável no `up` | Roda `start` antes do `up -d` quando há containers parados |
+| `-f /dev/fd/...` ou stdin | Não abre | O overlay é um arquivo temporário de verdade |
+
+A espera manual falha na hora se algum container estiver `Exited`, `Dead` ou `unhealthy`, e
+desiste depois de 90 segundos com `starting`.
 
 Por isso vale declarar `healthcheck` nos serviços de dados: é ele que o `doca` usa para saber
-que o banco está pronto antes de te entregar o shell.
-
----
-
-## Migrando do formato antigo
-
-Até a 1.0, o próprio `doca.yml` montava o código (`${DOCA_HOST_PATH}:/workspace`), o volume
-`home`, o `userns_mode: ${DOCA_USERNS}`, o PATH, os caches e o TZ. Um arquivo assim continua
-funcionando exatamente como antes: se o `doca` encontra `DOCA_HOST_PATH` no YAML, ele não
-injeta nada (injetar por cima duplicaria o `/workspace`). Só não ganha `:z` nem o fuso do host
-— no Fedora/Bazzite ele não sobe.
-
-Para migrar, apague do `doca.yml`:
-
-- no `app`: `hostname`, `userns_mode`, `working_dir`, `command: sleep infinity`, `volumes`
-  (código e `home`) e, do `environment`, `TZ`, `PATH`, `DOCA_INSIDE`, `COREPACK_*`,
-  `npm_config_*`, `PNPM_HOME`, `XDG_*`, `YARN_CACHE_FOLDER`;
-- nos demais serviços: `userns_mode` e `TZ`;
-- em `volumes:` no fim: o `home`.
-
-Se tiver RabbitMQ, troque o healthcheck para rodar como o usuário dele (ver
-[`exemplos/api-multi-servicos.yml`](exemplos/api-multi-servicos.yml)).
-
-Depois: `doca down && doca` — o `stop` não recria o container, e o bind novo só vale num
-container novo. Os volumes de dado são preservados.
-
-Atualize o `doca` **antes** de puxar um projeto já migrado: o script antigo com o YAML novo
-sobe o container sem o código montado.
+que o banco está pronto antes de te entregar o shell. Sem `healthcheck`, o container nunca fica
+`starting` e o `doca` não espera por ele.
 
 ---
 
 ## Segurança
 
 **A proteção não vem de onde os arquivos estão, vem de onde eles são executados.** Um
-`postinstall` é código arbitrário do autor do pacote.
+`postinstall` é código arbitrário do autor do pacote — rodando no container, ele só tem o que o
+container tem.
 
-### O que ele NÃO alcança
+### O que o `doca` dá ao container
 
-- Suas chaves SSH, credenciais de nuvem, cookies, outros projetos, o resto do disco. No PC ele
-  alcançaria tudo isso; no container, só a pasta do projeto.
-- Mais que o seu usuário. Com Podman rootless + `keep-id`, o container nunca pode mais que você.
-  Compare: Docker tradicional roda como **root no host**.
-- Mais recursos que o permitido — desde que você use `cpus`/`mem_limit`.
+No serviço `app`, o overlay monta exatamente duas coisas:
 
-### O que ele alcança
+- a pasta do projeto em `/workspace`;
+- o volume `home` em `/home/node`.
+
+Nada além disso é montado pelo `doca`: nem o seu `$HOME`, nem `~/.ssh`, nem outros projetos,
+nem o socket do engine. Por isso o ciclo de vida não funciona lá dentro (ver
+[Por que gerenciar só funciona de fora](#por-que-gerenciar-só-funciona-de-fora)). O que você
+acrescentar em `volumes:` no `doca.yml` também fica visível para o container.
+
+Sobre o usuário que roda o processo:
+
+- **Podman**: rootless com `keep-id` — o processo roda com o seu UID e não pode mais que você.
+- **Docker**: o `doca` injeta `userns_mode: host` e não define `user:`, então vale o usuário
+  padrão da imagem.
+
+Os limites de CPU e memória só existem se você declarar `cpus`/`mem_limit` no `doca.yml`.
+
+### O que o container alcança
 
 - **Tudo em `/workspace`**: pode alterar seu código e **ler seu `.env`** — senha de banco,
   credenciais de storage, tokens.
-- **`.git/hooks`**: é a única fuga real. Um `pre-commit` plantado ali é executado pelo **seu
-  host** no próximo commit. Para fechar, aponte `git config core.hooksPath` para fora do
-  repositório.
+- **A rede**: o `doca` não restringe rede. O container sai para a internet e alcança o que a
+  rede padrão do Compose alcança.
+
+### O que roda no host a partir da pasta do projeto
+
+O container pode escrever em qualquer arquivo de `/workspace`, e ela é a pasta do seu disco.
+Todo programa **do host** que executa algo dessa pasta executa o que o container escreveu:
+
+- **`.git/hooks`**: um `pre-commit` plantado ali roda no host no próximo commit. Para fechar,
+  aponte `git config core.hooksPath` para fora do repositório.
+- **Extensões do editor** que carregam código do projeto — ESLint (configuração e plugins de
+  `node_modules`), Prettier, o TypeScript do workspace.
+- **Arquivos de automação** que o host executa: `.vscode/tasks.json`, `.envrc` (direnv) e
+  qualquer script que você rode no host.
 
 Isso vale para qualquer ambiente em que você edite o código de fora do container. É o limite do
 desenho, não um defeito dele.
 
 ### Por que `node_modules` fica no seu disco
 
-Porque não muda nada em segurança — a execução acontece dentro do container de qualquer jeito —
-e em troca o editor enxerga os tipos, o autocomplete funciona e você apaga com `rm -rf`. O que
-vai para volume é só o que você nunca quer ver: cache e store.
+`pnpm install` e `pnpm dev` rodam no container. Com o `node_modules` no disco, o editor enxerga
+os tipos, o autocomplete funciona e você apaga com `rm -rf`. A contrapartida é a da seção
+anterior: as ferramentas do host que carregam o `node_modules` executam esse código no host. O
+que vai para volume é só o que você nunca quer ver: cache e store.
 
 ---
 
@@ -569,7 +630,8 @@ vai para volume é só o que você nunca quer ver: cache e store.
 O atalho guarda o caminho antigo. Vá ao novo local e rode `./doca install`.
 
 **`A porta X já está em uso`**
-Outro ambiente está de pé com a mesma porta. Pare-o, ou mude a porta publicada.
+Outro processo ou container está usando a porta — quando é um container, o `doca` diz qual.
+Pare-o, ou mude a porta publicada no `doca.yml`.
 
 **Um comando falha com "arquivo não encontrado", mas o arquivo existe**
 Você provavelmente está **dentro** do container, onde o caminho do host não existe. `exit` e
@@ -577,7 +639,9 @@ rode no host. A variável `DOCA_INSIDE` só existe dentro do container — dá p
 scripts para impedir que rodem no lugar errado.
 
 **Arquivos criados pelo container aparecem com dono errado**
-O container foi criado antes da migração ou por outra ferramenta. `doca down && doca`.
+No Podman, o `doca` injeta `keep-id` no `app`. Se o container não foi criado pelo `doca`,
+recrie: `doca down && doca`. No Docker, o `doca` não define `user:` — o dono é o usuário padrão
+da imagem.
 
 **`Permission denied` no Fedora/Bazzite ao ler o projeto**
 O container foi criado sem o `:z`. `doca down && doca` — o `doca doctor` deve mostrar
@@ -598,16 +662,50 @@ variável serve para criar um usuário comum). Não use `env_file` no serviço d
 
 **Aparece um `.pnpm-store` dentro do projeto**
 O pnpm não viu a configuração do store e criou um na raiz do `/workspace`. O `doca` injeta
-`npm_config_store_dir` (pnpm ≤ 10) e `pnpm_config_store_dir` (pnpm 11) — se o container é
-anterior a isso, `doca down && doca`. Depois apague a pasta `.pnpm-store` e reinstale.
+`npm_config_store_dir` (pnpm ≤ 10) e `pnpm_config_store_dir` (pnpm 11). Confira com
+`doca exec -T app env | grep store_dir`; se as duas não aparecem, recrie o container com
+`doca down && doca`. Depois apague a pasta `.pnpm-store` e reinstale.
 
 **`corepack: EACCES permission denied`**
 Ele tenta escrever em `/usr/local/bin`, que é do root. O `doca` já contorna instalando os
-atalhos no HOME e pondo `/home/node/.local/bin` no começo do PATH. Se o `doca.yml` declara o
-próprio `PATH`, apague a linha.
+atalhos no HOME e pondo `/home/node/.local/bin` no começo do PATH. Um `PATH` declarado no
+`doca.yml` é sobrescrito pelo overlay, então não interfere.
 
 **Estou dentro ou fora do container?**
 O prompt mostra `usuário@projeto:/workspace`. Ou cheque `$DOCA_INSIDE` — ela só existe dentro.
+
+---
+
+## O que mudou entre versões
+
+### 1.1.0
+
+- **O `doca` injeta o ambiente da máquina num overlay.** Bind do código, volume `home`,
+  `userns_mode`, `PATH`, caches, `TZ` e o `:z` do SELinux saem do `doca.yml` e passam a vir do
+  script (ver [O que o `doca` injeta](#o-que-o-doca-injeta)).
+- **Novo comando `stop`**: pausa os containers sem apagá-los.
+- **O formato da 1.0 deixou de ser aceito.** Na 1.0, o próprio `doca.yml` montava o código com
+  `${DOCA_HOST_PATH}:/workspace`. Na 1.1 o `doca` não reconhece mais esse formato e aplica o
+  overlay por cima dele — atualize o arquivo como abaixo.
+
+#### Atualizando um `doca.yml` da 1.0
+
+Apague do `doca.yml`:
+
+- no `app`: `hostname`, `userns_mode`, `working_dir`, `command: sleep infinity`, `volumes`
+  (código e `home`) e, do `environment`, `TZ`, `PATH`, `DOCA_INSIDE`, `COREPACK_*`,
+  `npm_config_*`, `PNPM_HOME`, `XDG_*`, `YARN_CACHE_FOLDER`;
+- nos demais serviços: `userns_mode` e `TZ`;
+- em `volumes:` no fim: o `home`.
+
+Se tiver RabbitMQ, troque o healthcheck para rodar como o usuário dele (ver
+[`exemplos/api-multi-servicos.yml`](exemplos/api-multi-servicos.yml)).
+
+Depois: `doca down && doca` — o `stop` não recria o container, e o bind novo só vale num
+container novo. Os volumes de dado são preservados.
+
+Atualize o `doca` **antes** de usar um `doca.yml` já no formato da 1.1: o script da 1.0 com o
+YAML novo sobe o container sem o código montado.
 
 ---
 
