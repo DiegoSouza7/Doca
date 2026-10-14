@@ -15,10 +15,6 @@ name: minha-api
 services:
   app:
     image: docker.io/library/node:24
-    hostname: minha-api
-
-    userns_mode: ${DOCA_USERNS}
-    working_dir: /workspace
 
     cpus: 2
     mem_limit: 8g
@@ -26,35 +22,13 @@ services:
     env_file: [".env"]
     ports: ["3333:3333"]
 
-    command: sleep infinity
-
     environment:
-      TZ: America/Sao_Paulo
-
-      COREPACK_DEFAULT_TO_LATEST: "0"
-      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
-
-      PATH: /home/node/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-      DOCA_INSIDE: minha-api
-
       # O .env costuma apontar o banco para localhost (porque funciona no PC).
       # Aqui dentro, localhost seria o próprio container — então mandamos para o
       # nome do serviço "mysql". environment vence env_file.
       # Use os nomes de variável que o seu framework lê.
       DB_HOST: mysql
       DB_PORT: "3306"
-
-      npm_config_store_dir: /home/node/.pnpm-store
-      PNPM_HOME: /home/node/.pnpm
-      XDG_CACHE_HOME: /home/node/.cache
-      XDG_DATA_HOME: /home/node/.local/share
-      npm_config_cache: /home/node/.npm
-      YARN_CACHE_FOLDER: /home/node/.yarn
-
-    volumes:
-      - ${DOCA_HOST_PATH}:/workspace
-      - home:/home/node
 
     # O doca espera o healthcheck do banco passar antes de te dar o shell.
     depends_on:
@@ -68,7 +42,6 @@ services:
     # recusa subir (root é reservado). Passamos só o necessário, interpolado
     # do .env.
     environment:
-      TZ: America/Sao_Paulo
       MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
       MYSQL_DATABASE: ${DB_NAME}
 
@@ -86,6 +59,6 @@ services:
       timeout: 3s
       retries: 20
 
+# O volume "home" (cache) o doca cria; aqui só os de dado.
 volumes:
-  home:
   db:

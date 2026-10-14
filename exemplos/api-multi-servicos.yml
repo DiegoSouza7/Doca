@@ -16,10 +16,6 @@ name: minha-api
 services:
   app:
     image: docker.io/library/node:24
-    hostname: minha-api
-
-    userns_mode: ${DOCA_USERNS}
-    working_dir: /workspace
 
     cpus: 2
     mem_limit: 8g
@@ -27,18 +23,7 @@ services:
     env_file: [".env"]
     ports: ["3333:3333"]
 
-    command: sleep infinity
-
     environment:
-      TZ: America/Sao_Paulo
-
-      COREPACK_DEFAULT_TO_LATEST: "0"
-      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
-
-      PATH: /home/node/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-      DOCA_INSIDE: minha-api
-
       # Cada serviço é alcançado pelo NOME, na porta INTERNA. Isto sobrescreve
       # o localhost que costuma estar no .env. Use os nomes de variável que o
       # seu framework lê.
@@ -50,17 +35,6 @@ services:
 
       # A URL da fila também aponta para o nome do serviço.
       AMQP_URL: amqp://guest:guest@rabbitmq:5672
-
-      npm_config_store_dir: /home/node/.pnpm-store
-      PNPM_HOME: /home/node/.pnpm
-      XDG_CACHE_HOME: /home/node/.cache
-      XDG_DATA_HOME: /home/node/.local/share
-      npm_config_cache: /home/node/.npm
-      YARN_CACHE_FOLDER: /home/node/.yarn
-
-    volumes:
-      - ${DOCA_HOST_PATH}:/workspace
-      - home:/home/node
 
     # Espera os três ficarem saudáveis antes de te dar o shell.
     depends_on:
@@ -74,7 +48,6 @@ services:
   mysql:
     image: docker.io/library/mysql:8
     environment:
-      TZ: America/Sao_Paulo
       MYSQL_ROOT_PASSWORD: ${DB_PASSWORD}
       MYSQL_DATABASE: ${DB_NAME}
     ports: ["3306:3306"] # opcional: só para abrir no seu editor de SQL
@@ -99,12 +72,6 @@ services:
 
   rabbitmq:
     image: docker.io/library/rabbitmq:3-management
-    # Precisa do mesmo userns do app. Sob Podman rootless, sem isto o RabbitMQ
-    # cria o .erlang.cookie como um usuário e tenta lê-lo como outro, e não
-    # sobe (EACCES). Ao contrário do MySQL e do Redis, ele não ajusta a
-    # permissão sozinho. No Docker rootful, ${DOCA_USERNS} vira "host" e isto
-    # não faz diferença.
-    userns_mode: ${DOCA_USERNS}
     environment:
       RABBITMQ_DEFAULT_USER: guest
       RABBITMQ_DEFAULT_PASS: guest
@@ -114,14 +81,16 @@ services:
     volumes:
       - rabbit:/var/lib/rabbitmq
     healthcheck:
-      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      # Como rabbitmq, não root: o ping cria o .erlang.cookie se ele ainda não
+      # existe, e um cookie do root impede o servidor de subir (eacces).
+      test: ["CMD", "gosu", "rabbitmq", "rabbitmq-diagnostics", "-q", "ping"]
       interval: 10s
       timeout: 5s
       retries: 15
       start_period: 20s
 
+# O volume "home" (cache) o doca cria; aqui só os de dado.
 volumes:
-  home:
   db:
   redis:
   rabbit:

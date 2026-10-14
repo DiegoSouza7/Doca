@@ -1,57 +1,19 @@
 # Exemplo doca — Next.js (front-end puro, sem serviços)
 #
 # Copie para a raiz do projeto como "doca.yml" e ajuste name/imagem/porta.
+# Bind do código, userns, SELinux, cache, PATH, TZ e o shell vazio vêm do
+# doca — o mesmo arquivo vale no Zorin, no Fedora e no Bazzite.
 # Depois: cd projeto && doca
 
 name: meu-front
 
 services:
   app:
+    # Nome completo: o Fedora recusa nome curto (node:24) sem um terminal.
     image: docker.io/library/node:24
-    hostname: meu-front
-
-    # keep-id no Podman, host no Docker — o doca preenche. Sem isto, o que o
-    # container cria na sua pasta sai com dono errado.
-    userns_mode: ${DOCA_USERNS}
-
-    working_dir: /workspace
 
     cpus: 2
     mem_limit: 6g
 
     env_file: [".env.local"]
     ports: ["3000:3000"]
-
-    # Fica de pé esperando você. Quem roda "pnpm dev" é você.
-    command: sleep infinity
-
-    environment:
-      TZ: America/Sao_Paulo
-
-      # A trava de versão do gerenciador (ver README).
-      COREPACK_DEFAULT_TO_LATEST: "0"
-      COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
-
-      # PATH inteiro: o Compose substitui a variável, não soma. O prefixo é
-      # onde o corepack instala pnpm/yarn.
-      PATH: /home/node/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-
-      DOCA_INSIDE: meu-front
-
-      # Cache fora do seu disco (ver README).
-      npm_config_store_dir: /home/node/.pnpm-store
-      PNPM_HOME: /home/node/.pnpm
-      XDG_CACHE_HOME: /home/node/.cache
-      XDG_DATA_HOME: /home/node/.local/share
-      npm_config_cache: /home/node/.npm
-      YARN_CACHE_FOLDER: /home/node/.yarn
-
-    volumes:
-      # Código, node_modules e .next/ ficam na sua pasta: o editor enxerga e
-      # você apaga com rm -rf.
-      - ${DOCA_HOST_PATH}:/workspace
-      # Cache e store, fora do seu disco.
-      - home:/home/node
-
-volumes:
-  home:

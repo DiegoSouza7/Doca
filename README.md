@@ -29,6 +29,7 @@ terminal: bash do sistema, VSCode, Cursor, e também dentro do **VSCode Flatpak*
 - [Convenções obrigatórias](#convenções-obrigatórias)
 - [Exemplos](#exemplos)
 - [Como funciona](#como-funciona)
+- [Migrando do formato antigo](#migrando-do-formato-antigo)
 - [Segurança](#segurança)
 - [Problemas comuns](#problemas-comuns)
 - [Licença](#licença)
@@ -66,17 +67,22 @@ A ideia é uma divisão de responsabilidades:
 
 | Peça | Cuida de |
 |---|---|
-| **`doca`** (script global) | O que depende **da máquina**: sandbox, engine, caminhos, ciclo de vida |
-| **`doca.yml`** (um por projeto) | O que depende **do projeto**: imagem, versões, recursos, serviços |
+| **`doca`** (script global) | O que depende **da máquina**: sandbox, engine, SELinux, userns, bind do código, cache, fuso, ciclo de vida |
+| **`doca.yml`** (um por projeto) | O que depende **do projeto**: imagem, versões, recursos, portas, serviços, volumes de dado |
 
-O script não sabe o que é Node, pnpm ou MySQL. Ele sobe qualquer `doca.yml`.
+O `doca.yml` não cita nada da máquina — por isso o **mesmo arquivo**, versionado no Git, sobe
+igual no Zorin/Ubuntu, no Fedora e no Bazzite. Quem descobre em que sistema está e se adapta é
+o script.
 
 ---
 
 ## Requisitos
 
-- **Linux** (testado em Zorin OS 18 / Ubuntu 24.04)
-- **Podman** (rootless, recomendado) + `podman-compose`, **ou** **Docker** + Docker Compose
+- **Linux** — testado em Zorin OS 18 / Ubuntu 24.04 (podman-compose 1.0.6 do apt) e em
+  Bazzite 44 / Fedora (podman-compose 1.6 via Homebrew, SELinux em enforcing)
+- **Podman** (rootless, recomendado) + `podman-compose`, **ou** **Docker** + Docker Compose.
+  Em distro imutável (Bazzite, Silverblue), instale o `podman-compose` pelo `brew` — nada vai
+  para `/usr`
 - **cgroups v2** com controladores delegados, para que os limites de CPU/memória valham
 
 Não precisa de Node, Python ou qualquer runtime instalado no host.
@@ -84,14 +90,16 @@ Não precisa de Node, Python ou qualquer runtime instalado no host.
 Confira tudo de uma vez com `doca doctor`:
 
 ```
-doca 1.0.0
+doca 1.1.0
 
 sandbox    nenhum
-engine     podman version 4.9.3
-compose    podman-compose version: 1.0.6
+engine     podman version 5.8.7
+compose    podman-compose version 1.6.0
 socket     unix:///run/user/1000/podman/podman.sock
-userns     keep-id
-cgroup     cpu memory pids (limites valem)
+userns     keep-id (só no app)
+selinux    enforcing (bind do código com :z)
+fuso       America/Sao_Paulo
+cgroup     cpu io memory pids (limites valem)
 
 projeto    /home/user/projetos/meu-projeto
 arquivo    doca.yml
@@ -242,68 +250,50 @@ name: meu-projeto
 services:
   app:
     image: docker.io/library/node:22
-    hostname: meu-projeto
-    userns_mode: ${DOCA_USERNS}
-    working_dir: /workspace
-    command: sleep infinity
-    environment:
-      PATH: /home/node/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-      DOCA_INSIDE: meu-projeto
-    volumes:
-      - ${DOCA_HOST_PATH}:/workspace
-      - home:/home/node
-
-volumes:
-  home:
 ```
 
-O `command: sleep infinity` é o coração da ideia: o container **não roda a aplicação**. Ele fica
-de pé, vazio, esperando você digitar — como uma máquina dedicada ao projeto. Quem roda `pnpm dev`
-é você.
+Só isso. O `name:` vira o hostname do container e o prefixo dos volumes; o resto o `doca` põe.
 
-### As duas variáveis que o `doca` injeta
+### O que o `doca` injeta
 
-Você **não** define estas — o script as exporta antes de chamar o Compose:
+Antes de chamar o Compose, o script gera um segundo arquivo Compose (o *overlay*) e passa os dois:
+`-f doca.yml -f <overlay>`. O Compose mescla — é Compose puro, sem formato próprio. O overlay é
+um arquivo temporário fora do projeto, apagado quando o `doca` termina; nada é gravado na pasta
+do projeto. (Tem que ser arquivo: o podman-compose 1.0.6 não lê `/dev/fd` nem stdin.)
 
-| Variável | O que é |
-|---|---|
-| `${DOCA_HOST_PATH}` | O caminho real do projeto no host. Necessário porque o que um sandbox enxerga nem sempre é o caminho real |
-| `${DOCA_USERNS}` | `keep-id` no Podman, `host` no Docker. É o que faz os arquivos criados pelo container saírem com o **seu** dono |
+**No serviço `app`:**
 
-### A trava de versão do gerenciador
+| O quê | Valor | Por quê |
+|---|---|---|
+| Bind do código | `<pasta real>:/workspace` (`:z` com SELinux) | Código e `node_modules` ficam no seu disco, para o editor enxergar |
+| `home:/home/node` | volume | Cache, store do pnpm e histórico fora do seu disco |
+| `userns_mode` | `keep-id` no Podman, `host` no Docker | Arquivos criados pelo container saem com o **seu** dono |
+| `command` | `sleep infinity` | O container **não roda a aplicação**: fica de pé esperando você. Quem roda `pnpm dev` é você |
+| `working_dir`, `hostname` | `/workspace`, o `name:` | |
+| `PATH` | começa com `/home/node/.local/bin` | Onde o corepack instala pnpm/yarn |
+| `COREPACK_DEFAULT_TO_LATEST=0` | | A trava: vale o gerenciador que veio com este Node, não o mais recente publicado |
+| `COREPACK_ENABLE_DOWNLOAD_PROMPT=0` | | Sem "continuar? [Y/n]" no meio do comando |
+| `npm_config_store_dir` e `pnpm_config_store_dir` | `/home/node/.pnpm-store` | Store fora do projeto. O pnpm ≤ 10 lê a primeira; o 11 só a segunda |
+| Caches (`XDG_*`, `npm_config_cache`, `YARN_CACHE_FOLDER`, `PNPM_HOME`) | sob `/home/node` | |
+| `DOCA_INSIDE` | o `name:` | Só existe dentro — scripts podem checar onde estão |
+| `TZ` | o fuso do host | Data do container igual à sua |
 
-```yaml
-environment:
-  # Sem esta linha, o corepack ignora o gerenciador que veio com este Node e
-  # baixa o mais recente publicado — que pode não suportar a versão fixada
-  # na imagem. Com ela, vale o que veio junto, como numa instalação local.
-  COREPACK_DEFAULT_TO_LATEST: "0"
+**Nos demais serviços:** só o `TZ` do host. Banco, cache e fila rodam como a imagem manda — os
+entrypoints oficiais (MySQL, RabbitMQ, Redis) começam como root e acertam o dono do próprio
+volume. Não declare `userns_mode` neles.
 
-  # Sem isto, ele pergunta "continuar? [Y/n]" no meio do seu comando.
-  COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
-```
+Se você declarar no `doca.yml` algo que o overlay também define, o overlay vence (variáveis de
+ambiente são somadas).
 
-### Cache fora do seu disco
+### Imagem com nome completo
 
-```yaml
-environment:
-  # store_dir é o mais importante: sem ele o pnpm cria um .pnpm-store DENTRO
-  # do projeto (ao lado do node_modules, para usar hardlinks). Apontando para
-  # o HOME (que é volume), o cache não toca o seu disco.
-  npm_config_store_dir: /home/node/.pnpm-store
-  PNPM_HOME: /home/node/.pnpm
-  XDG_CACHE_HOME: /home/node/.cache
-  XDG_DATA_HOME: /home/node/.local/share
-  npm_config_cache: /home/node/.npm
-  YARN_CACHE_FOLDER: /home/node/.yarn
-```
+Use `docker.io/library/node:22`, não `node:22`. O Fedora/Bazzite vem com
+`short-name-mode = "enforcing"`: sem um terminal para perguntar o registry, ele recusa nome
+curto. Com o nome completo, o mesmo arquivo funciona em qualquer distro.
 
-### Fuso e limites de recursos
+### Limites de recursos
 
 ```yaml
-environment:
-  TZ: America/Sao_Paulo    # data igual à do host
-
 cpus: 4                    # no nível do serviço
 mem_limit: 8g
 ```
@@ -319,9 +309,11 @@ doca exec -T app cat /sys/fs/cgroup/cpu.max      # 4 cpus → 400000 100000
 
 ```yaml
 volumes:
-  home:      # cache e store — o nuke apaga sem perguntar
   db:        # dados — o nuke pergunta antes
 ```
+
+O volume `home` (cache e store) quem cria é o `doca` — o `nuke` apaga sem perguntar. No
+`doca.yml` vão só os volumes de dado.
 
 **Não coloque `name:` fixo** nos volumes. Sem ele, o Compose prefixa com o nome do projeto
 (`meu-projeto_home`, `meu-projeto_db`) — é o que torna o mesmo arquivo copiável entre projetos
@@ -348,13 +340,9 @@ qualquer nome.
 
 ### 2. O `HOME` do container é `/home/node`
 
-```yaml
-volumes:
-  - home:/home/node     # ← este caminho exato
-```
-
-É onde o `doca` instala os atalhos do corepack, escreve o `.bashrc` e guarda o cache. Imagens
-oficiais do Node já têm o usuário `node` com esse HOME.
+O `doca` monta o volume `home` em `/home/node` e é ali que instala os atalhos do corepack,
+escreve o `.bashrc` e guarda o cache. Imagens oficiais do Node já têm o usuário `node` (UID
+1000) com esse HOME.
 
 ### 3. A imagem tem `bash`
 
@@ -378,7 +366,8 @@ A pasta [`exemplos/`](exemplos/) tem arquivos completos e copiáveis:
 | [`api-multi-servicos.yml`](exemplos/api-multi-servicos.yml) | API + MySQL + Redis + RabbitMQ |
 
 Copie para a raiz do projeto como `doca.yml` e ajuste o `name:`, a imagem e as portas.
-Os três foram validados subindo de verdade neste ambiente.
+Os três passam no `config` do podman-compose 1.0.6 e 1.6 e do Docker Compose, já mesclados
+com o overlay do `doca`.
 
 ### Como os serviços se enxergam
 
@@ -463,6 +452,29 @@ Isso importa mais do que parece: o `/tmp` que o VSCode Flatpak enxerga **não é
 sistema. São dois mundos com o mesmo nome. Por isso o script resolve o caminho real do projeto
 (`realpath`) antes de entregá-lo ao engine.
 
+### Debian × Fedora
+
+O mesmo `doca.yml` sobe nos dois; o que muda, o script resolve:
+
+| | Zorin / Ubuntu | Fedora / Bazzite |
+|---|---|---|
+| SELinux | não tem — o bind vai sem sufixo | em enforcing, o bind ganha `:z` |
+| podman-compose | 1.0.6 (apt) | 1.6 (brew, no imutável) |
+| `/home` | pasta comum | link para `/var/home` (o `realpath` resolve) |
+
+**Por que `:z` e não `:Z`.** Sem rótulo, o SELinux nega ao container a leitura da pasta do
+projeto (`EACCES` já no `package.json`). O `:z` rotula a pasta como `container_file_t`
+*compartilhado*: o container lê e escreve, e o seu editor e o git — inclusive em Flatpak —
+continuam lendo. O `:Z` seria privado de um container só. O script não usa `label=disable`
+nem `chcon`, e só lê `/sys/fs/selinux/enforce` — nada é gravado no sistema.
+
+### Por que o `keep-id` fica só no `app`
+
+O `app` é o único que escreve na sua pasta, e o `keep-id` é o que faz esses arquivos saírem com
+o seu dono. Nos outros serviços ele atrapalharia: com `keep-id` o Podman roda o processo como o
+seu UID, e o MySQL não consegue mais ler o próprio volume (`binlog.index: Permission denied`).
+Sem ele, os entrypoints oficiais começam como root e acertam o dono do volume sozinhos.
+
 ### Guard de produção
 
 Antes de subir, o `doca` lê `.env` e `.env.local` procurando `NODE_ENV` ou
@@ -489,6 +501,33 @@ para você não precisar saber que elas existem:
 
 Por isso vale declarar `healthcheck` nos serviços de dados: é ele que o `doca` usa para saber
 que o banco está pronto antes de te entregar o shell.
+
+---
+
+## Migrando do formato antigo
+
+Até a 1.0, o próprio `doca.yml` montava o código (`${DOCA_HOST_PATH}:/workspace`), o volume
+`home`, o `userns_mode: ${DOCA_USERNS}`, o PATH, os caches e o TZ. Um arquivo assim continua
+funcionando exatamente como antes: se o `doca` encontra `DOCA_HOST_PATH` no YAML, ele não
+injeta nada (injetar por cima duplicaria o `/workspace`). Só não ganha `:z` nem o fuso do host
+— no Fedora/Bazzite ele não sobe.
+
+Para migrar, apague do `doca.yml`:
+
+- no `app`: `hostname`, `userns_mode`, `working_dir`, `command: sleep infinity`, `volumes`
+  (código e `home`) e, do `environment`, `TZ`, `PATH`, `DOCA_INSIDE`, `COREPACK_*`,
+  `npm_config_*`, `PNPM_HOME`, `XDG_*`, `YARN_CACHE_FOLDER`;
+- nos demais serviços: `userns_mode` e `TZ`;
+- em `volumes:` no fim: o `home`.
+
+Se tiver RabbitMQ, troque o healthcheck para rodar como o usuário dele (ver
+[`exemplos/api-multi-servicos.yml`](exemplos/api-multi-servicos.yml)).
+
+Depois: `doca down && doca` — o `stop` não recria o container, e o bind novo só vale num
+container novo. Os volumes de dado são preservados.
+
+Atualize o `doca` **antes** de puxar um projeto já migrado: o script antigo com o YAML novo
+sobe o container sem o código montado.
 
 ---
 
@@ -538,7 +577,19 @@ rode no host. A variável `DOCA_INSIDE` só existe dentro do container — dá p
 scripts para impedir que rodem no lugar errado.
 
 **Arquivos criados pelo container aparecem com dono errado**
-Falta o `userns_mode: ${DOCA_USERNS}` no serviço.
+O container foi criado antes da migração ou por outra ferramenta. `doca down && doca`.
+
+**`Permission denied` no Fedora/Bazzite ao ler o projeto**
+O container foi criado sem o `:z`. `doca down && doca` — o `doca doctor` deve mostrar
+`selinux    enforcing (bind do código com :z)`.
+
+**O RabbitMQ não sobe: `.erlang.cookie: eacces`**
+O healthcheck rodou `rabbitmq-diagnostics` como root antes do servidor criar o cookie. Use
+`["CMD", "gosu", "rabbitmq", "rabbitmq-diagnostics", "-q", "ping"]`. Se o volume já ficou com
+o cookie do root, um `doca down && doca` resolve: o entrypoint acerta o dono ao subir.
+
+**`short-name resolution enforced but cannot prompt without a TTY`**
+A imagem está com nome curto. Use o nome completo: `docker.io/library/node:22`.
 
 **O MySQL não sobe**
 Se o seu `.env` tem `MYSQL_USER=root`, a imagem oficial recusa iniciar (`root` é reservado — a
@@ -546,11 +597,14 @@ variável serve para criar um usuário comum). Não use `env_file` no serviço d
 `MYSQL_ROOT_PASSWORD` e `MYSQL_DATABASE` por `environment`.
 
 **Aparece um `.pnpm-store` dentro do projeto**
-Falta o `npm_config_store_dir`. Sem ele, o pnpm cria o store ao lado do `node_modules`.
+O pnpm não viu a configuração do store e criou um na raiz do `/workspace`. O `doca` injeta
+`npm_config_store_dir` (pnpm ≤ 10) e `pnpm_config_store_dir` (pnpm 11) — se o container é
+anterior a isso, `doca down && doca`. Depois apague a pasta `.pnpm-store` e reinstale.
 
 **`corepack: EACCES permission denied`**
 Ele tenta escrever em `/usr/local/bin`, que é do root. O `doca` já contorna instalando os
-atalhos no HOME — confirme que o `PATH` do `doca.yml` começa com `/home/node/.local/bin`.
+atalhos no HOME e pondo `/home/node/.local/bin` no começo do PATH. Se o `doca.yml` declara o
+próprio `PATH`, apague a linha.
 
 **Estou dentro ou fora do container?**
 O prompt mostra `usuário@projeto:/workspace`. Ou cheque `$DOCA_INSIDE` — ela só existe dentro.
