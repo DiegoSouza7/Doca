@@ -121,8 +121,8 @@ doca_host_timezone() {
 # ---------------------------------------------------------------------------
 # 4. Guard de produção
 #
-# Mesmo bloqueio que os Makefiles já fazem hoje: se o ambiente declarado não
-# for development, morre antes de subir qualquer coisa.
+# Se o ambiente declarado não for development, morre antes de qualquer
+# comando de projeto.
 # ---------------------------------------------------------------------------
 
 doca_assert_development() {
@@ -158,23 +158,14 @@ doca_load_project() {
 	# O caminho do host, não o que o sandbox enxerga: é ele que vai no bind
 	# mount. (O /tmp do flatpak, por exemplo, não é o /tmp do host.)
 	DOCA_HOST_PATH=$(realpath "$DOCA_ROOT")
-	export DOCA_HOST_PATH
 
 	doca_assert_development "$DOCA_ROOT"
 	doca_detect_engine
-	export DOCA_USERNS
 
 	# O nome do projeto sai do "name:" do doca.yml e prefixa todos os volumes.
 	DOCA_PROJECT=$(sed -n 's/^name:[[:space:]]*//p' "$DOCA_ROOT/$DOCA_FILE" | head -1)
 	[ -n "$DOCA_PROJECT" ] ||
 		doca_die "O $DOCA_FILE precisa de um campo 'name:' no topo."
-
-	# Formato antigo: o próprio YAML monta o código via ${DOCA_HOST_PATH}.
-	# Injetar por cima duplicaria o /workspace; ele roda como sempre rodou.
-	if grep -q '^[^#]*DOCA_HOST_PATH' "$DOCA_ROOT/$DOCA_FILE"; then
-		DOCA_LEGACY=1
-		return 0
-	fi
 
 	# O podman-compose 1.0.6 (apt do Zorin) dá realpath em cada -f: /dev/fd,
 	# stdin e <(...) viram "pipe:[...]" e não abrem. Precisa ser arquivo de
@@ -240,7 +231,7 @@ doca_overlay() {
 
 doca_compose() {
 	# shellcheck disable=SC2086
-	(cd "$DOCA_ROOT" && $DOCA_COMPOSE -f "$DOCA_FILE" ${DOCA_OVERLAY:+-f "$DOCA_OVERLAY"} "$@")
+	(cd "$DOCA_ROOT" && $DOCA_COMPOSE -f "$DOCA_FILE" -f "$DOCA_OVERLAY" "$@")
 }
 
 # ---------------------------------------------------------------------------
@@ -276,7 +267,7 @@ doca_explain_failure() {
 		grep ":${_port}->" | cut -d'|' -f1 | head -1)
 
 	doca_die "A porta $_port já está em uso${_who:+ pelo container '$_who'}.
-   Se for o ambiente antigo (docker-compose.yaml), pare-o antes: make down"
+   Pare quem a usa ou mude a porta publicada no $DOCA_FILE."
 }
 
 # ---------------------------------------------------------------------------
@@ -382,8 +373,6 @@ doca_has_stopped_containers() {
 
 doca_cmd_up() {
 	doca_load_project
-	[ -z "${DOCA_LEGACY:-}" ] ||
-		doca_info "$DOCA_FILE no formato antigo: roda como antes, sem :z nem TZ do host. Veja 'Migrando' no README."
 	doca_info "Subindo $DOCA_PROJECT ($DOCA_ENGINE)..."
 
 	# Containers parados pelo 'stop' religam com start, que não os recria. O
@@ -546,9 +535,6 @@ doca_cmd_doctor() {
 	if _root=$(doca_find_root 2>/dev/null); then
 		printf '\nprojeto    %s\n' "$_root"
 		printf 'arquivo    %s\n' "$DOCA_FILE"
-		if grep -q '^[^#]*DOCA_HOST_PATH' "$_root/$DOCA_FILE"; then
-			printf '\033[33mformato    antigo (o YAML monta o código) — veja Migrando no README\033[0m\n'
-		fi
 	else
 		printf '\nprojeto    (nenhum aqui — não achei um %s)\n' "$DOCA_FILE"
 	fi
