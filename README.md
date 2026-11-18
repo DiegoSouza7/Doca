@@ -46,7 +46,12 @@ pausa e `doca down` apaga os containers (seus volumes ficam) quando você quiser
 **A versão da linguagem é a que você declara — e não muda sozinha.** O `doca.yml` fixa a imagem
 (`node:22`, por exemplo), e uma trava impede que o gerenciador de pacotes seja baixado da
 internet numa versão incompatível. Você recebe o pnpm/yarn que veio com aquele Node, como numa
-instalação local.
+instalação local — ou fixa outro no próprio `doca.yml` (`DOCA_PACKAGE_MANAGER`), o caminho
+para o Node 25+, que não traz mais o corepack.
+
+**A imagem pode ganhar pacotes de sistema sem você construir outra.** Liste-os no `doca.yml`
+(`DOCA_PACKAGES`) e o `doca` os instala no container ao criá-lo — o `down` apaga junto, e a
+próxima subida instala de novo só o que estiver na lista.
 
 **Nada suja o seu computador.** Cache, store do pnpm e histórico do shell vão para um volume
 isolado. O código e o `node_modules` ficam na sua pasta (para o editor enxergar), e você apaga
@@ -98,10 +103,14 @@ Todos os testes foram feitos com **Podman rootless** e com imagens prontas (`ima
 | Zorin OS 18.1 / Ubuntu 24.04 | 1.0.6 (apt) |
 | Bazzite 44 / Fedora, SELinux em enforcing | 1.6 (Homebrew) |
 
+`DOCA_PACKAGE_MANAGER` e `DOCA_PACKAGES` (1.2.0) foram testados só no Zorin, com as imagens
+`node:20`, `node:24` e `node:26` (Debian, `apt-get`). Os caminhos de `apk` e `dnf` ainda não
+foram testados.
+
 Confira tudo de uma vez com `doca doctor`:
 
 ```
-doca 1.1.0
+doca 1.2.0
 
 sandbox    nenhum
 engine     podman version 5.8.7
@@ -296,7 +305,7 @@ do projeto. (Tem que ser arquivo: o podman-compose 1.0.6 não lê `/dev/fd` nem 
 | `userns_mode` | `keep-id` no Podman, `host` no Docker | No Podman, o processo roda com o seu UID e os arquivos criados pelo container saem com o **seu** dono. No Docker, o `doca` não define `user:` — vale o usuário padrão da imagem |
 | `command` | `sleep infinity` | O container **não roda a aplicação**: fica de pé esperando você. Quem roda `pnpm dev` é você |
 | `working_dir`, `hostname` | `/workspace`, o `name:` | |
-| `PATH` | começa com `/home/node/.local/bin` | Onde o corepack instala pnpm/yarn |
+| `PATH` | começa com `/home/node/.local/doca/bin:/home/node/.local/bin` | O primeiro é o gerenciador do `DOCA_PACKAGE_MANAGER`, que vence o do segundo, onde o corepack instala pnpm/yarn |
 | `COREPACK_DEFAULT_TO_LATEST=0` | | A trava: vale o gerenciador que veio com este Node, não o mais recente publicado |
 | `COREPACK_ENABLE_DOWNLOAD_PROMPT=0` | | Sem "continuar? [Y/n]" no meio do comando |
 | `npm_config_store_dir` e `pnpm_config_store_dir` | `/home/node/.pnpm-store` | Store fora do projeto. O pnpm ≤ 10 lê a primeira; o 11 só a segunda |
@@ -348,6 +357,71 @@ sem colisão.
 O `nuke` trata por convenção: qualquer volume terminado em `_home` é cache e some direto;
 qualquer outro é dado e pergunta antes.
 
+### Gerenciador de pacotes
+
+Por padrão vale o pnpm/yarn do corepack que vem com o Node da imagem. Para fixar outro, declare
+no `environment` do `app`:
+
+```yaml
+services:
+  app:
+    image: docker.io/library/node:26
+    environment:
+      DOCA_PACKAGE_MANAGER: pnpm@12.22.0   # ou npm@<versão>
+```
+
+O `doca` instala essa versão com `npm install -g --engine-strict` em `/home/node/.local/doca`,
+no volume `home`: sobrevive ao `down` e só é reinstalada quando a versão declarada muda. Se ela
+não suportar o Node da imagem (ou não existir), a subida **para** com o erro do npm e os
+containers ficam parados. Corrija e rode `doca down && doca`. Tirou a variável? Na próxima
+subida o `doca` apaga essa instalação e volta a valer o corepack.
+
+Aceita só `pnpm@<versão>` e `npm@<versão>`. O Yarn 2+ depende do corepack e fica de fora.
+
+O que vale, conforme o que o projeto declara:
+
+| `DOCA_PACKAGE_MANAGER` | `packageManager` no `package.json` | Resultado |
+|---|---|---|
+| — | — | O gerenciador do corepack da imagem |
+| — | declarado | O corepack segue o `package.json`, como sempre |
+| declarado | — | A versão do `doca.yml` |
+| declarado | declarado | A versão do `doca.yml`, **com aviso**: o pnpm lê o `package.json` e pode trocar de versão sozinho. Fique com só um dos dois |
+
+Imagem sem corepack (Node 25+) e sem `DOCA_PACKAGE_MANAGER`: o `doca` avisa a cada subida que
+não há pnpm lá dentro.
+
+### Pacotes de sistema
+
+Bibliotecas que a imagem não tem (as do Chromium para testes end-to-end, um `xvfb`, um
+cliente de banco) vão no `environment` do `app`, separadas por espaço:
+
+```yaml
+services:
+  app:
+    image: docker.io/library/node:26
+    environment:
+      DOCA_PACKAGES: >-
+        libnss3
+        libgtk-3-0t64
+        xvfb
+```
+
+Ao criar o container, o `doca` instala a lista como root, com o instalador que a imagem tiver
+(`apt-get`, `apk` ou `dnf`). Os pacotes ficam **no container, não na imagem**:
+
+| Comando | Pacotes |
+|---|---|
+| `doca stop` e `doca` | Continuam lá — o container é o mesmo |
+| `doca down` e `doca`, `rebuild`, `update` | Instalados de novo, só os que estão na lista |
+
+Por isso, tirar um pacote da lista vale depois de `doca down && doca`, como qualquer outra
+mudança no `doca.yml`. A reinstalação a cada container novo usa a rede e leva o tempo do
+`apt-get`.
+
+Os nomes dependem da distro da imagem, e por isso a lista é sua: no Debian 13 (base do
+`node:26`) é `libgtk-3-0t64`; no Debian 12, `libgtk-3-0`. Se um pacote falhar, a subida
+**para** com as últimas linhas do instalador e os containers ficam parados.
+
 ---
 
 ## Convenções obrigatórias
@@ -377,9 +451,9 @@ qualquer nome.
 
 ### 3. O `HOME` do container é `/home/node`
 
-O `doca` monta o volume `home` em `/home/node` e é ali que instala os atalhos do corepack,
-escreve o `.bashrc` e guarda o cache. Imagens oficiais do Node já têm o usuário `node` (UID
-1000) com esse HOME.
+O `doca` monta o volume `home` em `/home/node` e é ali que instala os atalhos do corepack e o
+gerenciador do `DOCA_PACKAGE_MANAGER`, escreve o `.bashrc` e guarda o cache. Imagens oficiais
+do Node já têm o usuário `node` (UID 1000) com esse HOME.
 
 ### 4. A imagem tem `bash`
 
@@ -590,6 +664,8 @@ Sobre o usuário que roda o processo:
 - **Podman**: rootless com `keep-id` — o processo roda com o seu UID e não pode mais que você.
 - **Docker**: o `doca` injeta `userns_mode: host` e não define `user:`, então vale o usuário
   padrão da imagem.
+- **Exceção**: com `DOCA_PACKAGES`, a instalação dos pacotes roda como root **do container**
+  (`exec -u 0`), só nesse comando. No Podman rootless, esse root não é o root do host.
 
 Os limites de CPU e memória só existem se você declarar `cpus`/`mem_limit` no `doca.yml`.
 
@@ -671,12 +747,35 @@ Ele tenta escrever em `/usr/local/bin`, que é do root. O `doca` já contorna in
 atalhos no HOME e pondo `/home/node/.local/bin` no começo do PATH. Um `PATH` declarado no
 `doca.yml` é sobrescrito pelo overlay, então não interfere.
 
+**`Não consegui instalar o gerenciador de DOCA_PACKAGE_MANAGER`**
+Com `EBADENGINE` na saída, a versão não suporta o Node da imagem (o pnpm 11, por exemplo, pede
+Node 22.13+): troque a versão ou a imagem. Com `ETARGET`, a versão não existe. Depois:
+`doca down && doca`.
+
+**`Não consegui instalar os pacotes de DOCA_PACKAGES`**
+Quase sempre é nome que não existe na distro da imagem — veja a linha do instalador na
+mensagem (`Unable to locate package`, no Debian). Corrija a lista e `doca down && doca`. Se foi
+a rede, só `doca` tenta de novo.
+
+**`Esta imagem não tem corepack`**
+Imagens do Node 25 em diante não trazem mais o corepack, e sem ele não há pnpm. Declare
+`DOCA_PACKAGE_MANAGER` (ver [Gerenciador de pacotes](#gerenciador-de-pacotes)).
+
 **Estou dentro ou fora do container?**
 O prompt mostra `usuário@projeto:/workspace`. Ou cheque `$DOCA_INSIDE` — ela só existe dentro.
 
 ---
 
 ## O que mudou entre versões
+
+### 1.2.0
+
+- **`DOCA_PACKAGE_MANAGER`**: fixa `pnpm@<versão>` ou `npm@<versão>` no `doca.yml`, sem
+  depender do corepack (ver [Gerenciador de pacotes](#gerenciador-de-pacotes)).
+- **`DOCA_PACKAGES`**: pacotes de sistema instalados no container ao criá-lo (ver
+  [Pacotes de sistema](#pacotes-de-sistema)).
+- O `PATH` injetado ganha `/home/node/.local/doca/bin` na frente.
+- Um `doca.yml` da 1.1 continua valendo sem mudança.
 
 ### 1.1.0
 

@@ -17,3 +17,12 @@ services:
 
     env_file: [".env.local"]
     ports: ["3000:3000"]
+
+    # Opcional. Sem estas variáveis vale o pnpm do corepack da imagem.
+    # environment:
+    #   # Fixa o gerenciador; obrigatório no Node 25+, que não traz o corepack.
+    #   DOCA_PACKAGE_MANAGER: pnpm@10.34.9
+    #   # Pacotes de sistema instalados no container (os nomes são da distro
+    #   # da imagem). Saem no "doca down" e voltam na próxima subida.
+    #   DOCA_PACKAGES: >-
+    #     xvfb
